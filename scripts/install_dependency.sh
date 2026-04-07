@@ -66,20 +66,7 @@ $PIP \
 # Flash Attention 2
 # -------------------
 echo ">>> Installing Flash Attention 2..."
-$PIP ninja==1.13.0 psutil pybind11 wheel
-
-# Try prebuilt wheel first, fall back to source build
-VERSION="${FLASH_ATTN_VERSION}"
-ABI_FLAG=$("${VENV_DIR}/bin/python" -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')")
-FILE="flash_attn-${VERSION}+cu12torch${TORCH_VERSION}cxx11abi${ABI_FLAG}-cp${PYTHON_VERSION_SHORT}-cp${PYTHON_VERSION_SHORT}-linux_x86_64.whl"
-REPO="Dao-AILab/flash-attention"
-URL="https://github.com/${REPO}/releases/download/v${VERSION}/${FILE}"
-
-echo ">>> Trying prebuilt flash-attn wheel: ${URL}"
-if ! $PIP "${URL}" 2>/dev/null; then
-    echo ">>> Prebuilt wheel not found, building from source..."
-    FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=32 $PIP --no-build-isolation "flash_attn==${VERSION}"
-fi
+$PIP "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
 
 # ------
 # vLLM
