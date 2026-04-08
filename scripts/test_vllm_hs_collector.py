@@ -1,331 +1,290 @@
 #!/usr/bin/env python3
 """
-Test vLLM hidden states extraction with Mooncake KV connector.
+Toy example: Mooncake hidden-state put/get round-trip.
 
-Uses vLLM's public APIs — no patching:
-  - speculative_config with method=extract_hidden_states
-  - kv_transfer_config pointing to our MooncakeHiddenStatesConnector
+Auto-launches mooncake_master, creates synthetic Eagle3 hidden states,
+writes them to the store, reads them back, and verifies bit-exact match.
 
-Tests 3 stages independently:
-  Stage 1: Import check (no GPU, no Mooncake)
-  Stage 2: Mooncake store put/get/remove cycle
-  Stage 3: Full pipeline — vLLM prefill → KV connector → Mooncake → verify
-
-Prerequisites:
-  pip install vllm>=0.12.0 mooncake torch transformers
+No GPU required — runs entirely on CPU with TCP transport.
+No Ray required — launches mooncake_master as a plain subprocess.
 
 Usage:
-  # Stage 1 only (import check):
-  python scripts/test_vllm_hs_collector.py --stage 1
+    python scripts/test_vllm_hs_collector.py
 
-  # Stage 2 (Mooncake store, needs mooncake_master running):
-  python scripts/test_vllm_hs_collector.py --stage 2
-
-  # Stage 3 (full pipeline, needs GPU + mooncake_master):
-  python scripts/test_vllm_hs_collector.py --stage 3 --model-path Qwen/Qwen2.5-0.5B-Instruct
-
-  # All stages:
-  python scripts/test_vllm_hs_collector.py --stage all --model-path Qwen/Qwen2.5-0.5B-Instruct
+    # Custom sizes:
+    python scripts/test_vllm_hs_collector.py --seq-len 256 --hidden-dim 3584 --num-samples 5
 """
 
 import argparse
+import atexit
+import os
+import shutil
+import signal
+import subprocess
 import sys
 import time
 
+import torch
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Test vLLM HS collector pipeline")
-    parser.add_argument("--stage", default="1", help="1, 2, 3, or all")
-    parser.add_argument("--model-path", default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--aux-layers", default=None, help="Comma-separated layer IDs (auto-detected if omitted)")
+
+# ─── Mooncake master lifecycle (no Ray) ──────────────────────
+
+def find_mooncake_master_bin():
+    if "MOONCAKE_BUILD_DIR" in os.environ:
+        return os.path.join(os.environ["MOONCAKE_BUILD_DIR"], "mooncake-store/src/mooncake_master")
+    found = shutil.which("mooncake_master")
+    if found:
+        return found
+    return os.path.expanduser("~/build/mooncake-store/src/mooncake_master")
+
+
+def launch_master(port=50051, http_port=8090, lease_ttl_ms=2000):
+    """Launch mooncake_master as a subprocess. Returns the Popen handle."""
+    binary = find_mooncake_master_bin()
+    if not os.path.exists(binary):
+        print(f"ERROR: mooncake_master not found at {binary}")
+        print("  Install mooncake or set MOONCAKE_BUILD_DIR")
+        sys.exit(1)
+
+    cmd = [
+        binary,
+        f"--port={port}",
+        f"--http_metadata_server_port={http_port}",
+        "--http_metadata_server_host=0.0.0.0",
+        "--enable_http_metadata_server=true",
+        f"--default_kv_lease_ttl={lease_ttl_ms}",
+    ]
+    print(f"  Launching: {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _kill():
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except Exception:
+                proc.kill()
+
+    atexit.register(_kill)
+    time.sleep(2)
+
+    if proc.poll() is not None:
+        stderr = proc.stderr.read().decode() if proc.stderr else ""
+        print(f"ERROR: mooncake_master exited with code {proc.returncode}")
+        if stderr:
+            print(f"  stderr: {stderr[:500]}")
+        sys.exit(1)
+
+    print(f"  mooncake_master running (PID {proc.pid})")
+    return proc
+
+
+# ─── Store helpers ───────────────────────────────────────────
+
+def make_config(master_host, master_port, metadata_port, seq_len, hidden_dim, lease_ttl=2.0):
+    """Create MooncakeConfig for a CPU-only TCP test."""
+    from verl.utils.mooncake.config import MooncakeConfig
+
+    return MooncakeConfig(
+        local_hostname=master_host,
+        metadata_server=f"http://{master_host}:{metadata_port}/metadata",
+        master_server_address=f"{master_host}:{master_port}",
+        global_segment_size=256 * 1024 * 1024,   # 256 MB (small for toy test)
+        local_buffer_size=128 * 1024 * 1024,      # 128 MB
+        protocol="tcp",
+        max_seq_len=seq_len,
+        hidden_dim=hidden_dim,
+        async_put_pool_size=1,
+        kv_lease_ttl_s=lease_ttl,  # must match master's --default_kv_lease_ttl
+    )
+
+
+def make_eagle3_tensors(seq_len, hidden_dim, num_aux_layers=3):
+    """Create synthetic tensors mimicking Eagle3 hidden-state extraction.
+
+    Returns the same structure that MooncakeHiddenStatesConnector would
+    produce during a vLLM prefill:
+      - hidden_states: (seq_len, hidden_dim * num_aux_layers)  bf16
+      - input_ids:     (seq_len,)                              int64
+      - last_hidden_states: (seq_len, hidden_dim)              bf16
+    """
+    hidden_states = torch.randn(seq_len, hidden_dim * num_aux_layers, dtype=torch.bfloat16)
+    input_ids = torch.randint(0, 152064, (seq_len,), dtype=torch.int64)  # Qwen2.5 vocab
+    last_hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+    return hidden_states, input_ids, last_hidden_states
+
+
+def fmt_bytes(n):
+    if n >= 1024**2:
+        return f"{n / 1024**2:.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def tensor_info(name, t):
+    nbytes = t.numel() * t.element_size()
+    return f"    {name:25s} {str(list(t.shape)):20s} {str(t.dtype):12s} {fmt_bytes(nbytes):>10s}"
+
+
+def tensor_preview(name, t, n=5):
+    flat = t.flatten().float()
+    vals = flat[:n].tolist()
+    preview = ", ".join(f"{v:+.4f}" for v in vals)
+    return f"    {name:25s} first {n}: [{preview}, ...]"
+
+
+# ─── Main test ───────────────────────────────────────────────
+
+def run_test(args):
+    from verl.utils.mooncake.eagle_store import EagleMooncakeStore
+
+    config = make_config(
+        master_host=args.master_host,
+        master_port=args.master_port,
+        metadata_port=args.metadata_port,
+        seq_len=args.seq_len,
+        hidden_dim=args.hidden_dim,
+        lease_ttl=args.lease_ttl,
+    )
+
+    # ── Connect two store clients (simulates inference → training) ──
+    print("\n[2/4] Connecting store clients...")
+    writer = EagleMooncakeStore(config)
+    writer.setup()
+    print("  Writer (inference side): connected")
+
+    reader = EagleMooncakeStore(config)
+    reader.setup()
+    print("  Reader (training side):  connected")
+
+    all_ok = True
+
+    for i in range(args.num_samples):
+        key = f"sample_{i:04d}"
+        print(f"\n{'─' * 60}")
+        print(f"  Sample {i+1}/{args.num_samples}  key={key}")
+        print(f"{'─' * 60}")
+
+        # ── Create tensors ──
+        hs, ids, lhs = make_eagle3_tensors(args.seq_len, args.hidden_dim)
+
+        print("\n  [PUT] Tensors to write:")
+        print(tensor_info("hidden_states", hs))
+        print(tensor_info("input_ids", ids))
+        print(tensor_info("last_hidden_states", lhs))
+        total = hs.numel() * hs.element_size() + ids.numel() * ids.element_size() + lhs.numel() * lhs.element_size()
+        print(f"    {'total':25s} {'':20s} {'':12s} {fmt_bytes(total):>10s}")
+
+        print(f"\n  [PUT] Tensor previews:")
+        print(tensor_preview("hidden_states", hs))
+        print(tensor_preview("input_ids", ids.float()))
+        print(tensor_preview("last_hidden_states", lhs))
+
+        # ── Write ──
+        t0 = time.time()
+        metadata = writer.put(key=key, hidden_states=hs, input_ids=ids, last_hidden_states=lhs)
+        writer.flush()
+        put_ms = (time.time() - t0) * 1000
+        print(f"\n  [PUT] Done in {put_ms:.1f} ms")
+        print(f"    returned shapes: {metadata['shapes']}")
+
+        # ── Read ──
+        t0 = time.time()
+        result = reader.get(
+            key=key,
+            shapes=metadata["shapes"],
+            dtypes=metadata["dtypes"],
+            device=torch.device("cpu"),
+        )
+        get_ms = (time.time() - t0) * 1000
+        print(f"\n  [GET] Done in {get_ms:.1f} ms")
+        print(f"  [GET] Retrieved tensors:")
+        print(tensor_info("hidden_states", result.hidden_states))
+        print(tensor_info("input_ids", result.input_ids))
+        if result.last_hidden_states is not None:
+            print(tensor_info("last_hidden_states", result.last_hidden_states))
+
+        print(f"\n  [GET] Retrieved previews:")
+        print(tensor_preview("hidden_states", result.hidden_states))
+        print(tensor_preview("input_ids", result.input_ids.float()))
+        if result.last_hidden_states is not None:
+            print(tensor_preview("last_hidden_states", result.last_hidden_states))
+
+        # ── Verify ──
+        hs_ok = torch.equal(hs, result.hidden_states)
+        ids_ok = torch.equal(ids, result.input_ids)
+        lhs_ok = result.last_hidden_states is not None and torch.equal(lhs, result.last_hidden_states)
+
+        status = "PASS" if (hs_ok and ids_ok and lhs_ok) else "FAIL"
+        print(f"\n  [VERIFY] hidden_states:      {'OK' if hs_ok else 'MISMATCH'}")
+        print(f"  [VERIFY] input_ids:          {'OK' if ids_ok else 'MISMATCH'}")
+        print(f"  [VERIFY] last_hidden_states: {'OK' if lhs_ok else 'MISMATCH'}")
+        print(f"  [VERIFY] ── {status} ──")
+
+        if not (hs_ok and ids_ok and lhs_ok):
+            all_ok = False
+
+        # ── Cleanup ──
+        reader.remove_eagle3_tensors(key, has_last_hidden_states=True)
+
+    # ── Summary ──
+    print(f"\n{'=' * 60}")
+    print(f"  {args.num_samples} samples, seq_len={args.seq_len}, hidden_dim={args.hidden_dim}")
+    print(f"  Result: {'ALL PASSED' if all_ok else 'SOME FAILED'}")
+    print(f"{'=' * 60}")
+
+    # Give deferred deletes time to run (must exceed TTL + buffer)
+    wait = args.lease_ttl + 1.5
+    print(f"\n  Waiting {wait:.1f}s for deferred deletes (lease TTL={args.lease_ttl}s)...")
+    time.sleep(wait)
+
+    print("  Closing stores...")
+    writer.close()
+    reader.close()
+
+    return all_ok
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Mooncake hidden-state put/get toy example")
     parser.add_argument("--master-host", default="localhost")
     parser.add_argument("--master-port", type=int, default=50051)
     parser.add_argument("--metadata-port", type=int, default=8090)
-    parser.add_argument("--prompt", default="The capital of France is")
-    parser.add_argument("--seq-len", type=int, default=128, help="For Mooncake store test (stage 2)")
-    parser.add_argument("--hidden-dim", type=int, default=4096, help="For Mooncake store test (stage 2)")
-    return parser.parse_args()
+    parser.add_argument("--seq-len", type=int, default=64, help="Sequence length per sample")
+    parser.add_argument("--hidden-dim", type=int, default=896, help="Hidden dimension (e.g. 896 for Qwen2.5-0.5B)")
+    parser.add_argument("--num-samples", type=int, default=3, help="Number of put/get cycles")
+    parser.add_argument("--lease-ttl", type=float, default=2.0, help="Mooncake lease TTL in seconds")
+    parser.add_argument("--skip-master", action="store_true", help="Don't launch mooncake_master (use existing)")
+    args = parser.parse_args()
 
+    print(f"{'=' * 60}")
+    print(f"  Mooncake Put/Get Toy Example")
+    print(f"{'=' * 60}")
 
-def header(title):
-    print(f"\n{'=' * 60}")
-    print(f"  {title}")
-    print(f"{'=' * 60}\n")
-
-
-# ─── Stage 1: Import check ────────────────────────────────────
-
-def stage1_imports():
-    header("Stage 1: Import check")
-    ok = True
-
-    checks = [
-        ("verl.utils.mooncake.config", "MooncakeConfig"),
-        ("verl.utils.mooncake.eagle_store", "EagleMooncakeStore"),
-        ("verl.utils.mooncake.eagle_store", "Eagle3TargetOutput"),
-        ("verl.utils.mooncake.hidden_states_connector", "MooncakeHiddenStatesConnector"),
-        ("verl.utils.mooncake.helpers", "calculate_eagle3_buffer_size"),
-        ("verl.utils.mooncake.store", "MooncakeHiddenStateStore"),
-        ("verl.utils.mooncake.buffers", "HostBufferPool"),
-        ("verl.utils.mooncake.deferred_delete", "DeferredDeleteManager"),
-        ("verl.models.eagle3.ops.loss", "compiled_forward_kl_loss"),
-        ("verl.models.eagle3.draft.base", "Eagle3DraftModel"),
-        ("verl.trainer.drafter.controller", "DrafterDataController"),
-    ]
-
-    for module, name in checks:
-        try:
-            mod = __import__(module, fromlist=[name])
-            getattr(mod, name)
-            print(f"  {module}.{name}: OK")
-        except Exception as e:
-            print(f"  {module}.{name}: FAIL ({e})")
-            ok = False
-
-    # vLLM-specific
-    try:
-        from vllm import LLM, SamplingParams
-        print(f"  vllm.LLM: OK")
-    except ImportError as e:
-        print(f"  vllm.LLM: FAIL ({e})")
-        ok = False
-
-    try:
-        from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
-        print(f"  vllm KVConnectorBase_V1: OK")
-    except ImportError as e:
-        print(f"  vllm KVConnectorBase_V1: FAIL ({e})")
-        ok = False
-
-    # DrafterDataController quick test
-    try:
-        from verl.trainer.drafter.controller import DrafterDataController, SampleMeta
-        ctrl = DrafterDataController(dp_size=4)
-        assert ctrl.sample_pool_size == 0
-        assert ctrl.drain_as_dataproto() is None
-        ctrl.push_samples([SampleMeta(mooncake_key="test", shapes={}, dtypes={}, seq_len=10)])
-        proto = ctrl.drain_as_dataproto()
-        assert proto is not None
-        assert len(proto) == 1
-        print(f"  DrafterDataController: OK (push/drain works)")
-    except Exception as e:
-        print(f"  DrafterDataController: FAIL ({e})")
-        ok = False
-
-    # Buffer size calc
-    try:
-        from verl.utils.mooncake.helpers import calculate_eagle3_buffer_size
-        size = calculate_eagle3_buffer_size(max_seq_len=8192, batch_size=8, hidden_dim=4096)
-        print(f"  calculate_eagle3_buffer_size: OK ({size / 1024**2:.0f} MB for 8 samples)")
-    except Exception as e:
-        print(f"  calculate_eagle3_buffer_size: FAIL ({e})")
-        ok = False
-
-    return ok
-
-
-# ─── Stage 2: Mooncake store ──────────────────────────────────
-
-def stage2_mooncake(args):
-    header("Stage 2: Mooncake store put/get/remove")
-
-    import torch
-    from verl.utils.mooncake.config import MooncakeConfig
-    from verl.utils.mooncake.eagle_store import EagleMooncakeStore
-
-    config = MooncakeConfig.from_master_address(
-        master_host=args.master_host,
-        master_port=args.master_port,
-        metadata_port=args.metadata_port,
-        protocol="tcp",
-        max_seq_len=args.seq_len,
-        hidden_dim=args.hidden_dim,
-    )
-    print(f"  Mooncake master: {config.master_server_address}")
-    print(f"  Protocol: {config.protocol}")
-
-    store = EagleMooncakeStore(config)
-    print(f"  Connecting...")
-    store.setup()
-    print(f"  Connected.\n")
-
-    # Create test tensors
-    seq_len, hidden_dim, num_aux = args.seq_len, args.hidden_dim, 3
-    hidden_states = torch.randn(seq_len, hidden_dim * num_aux, dtype=torch.bfloat16)
-    input_ids = torch.randint(0, 32000, (seq_len,), dtype=torch.int64)
-    last_hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
-
-    print(f"  Test tensors:")
-    print(f"    hidden_states:      {hidden_states.shape} {hidden_states.dtype}")
-    print(f"    input_ids:          {input_ids.shape} {input_ids.dtype}")
-    print(f"    last_hidden_states: {last_hidden_states.shape} {last_hidden_states.dtype}")
-
-    # PUT
-    key = "test_stage2_001"
-    t0 = time.time()
-    metadata = store.put(key=key, hidden_states=hidden_states, input_ids=input_ids, last_hidden_states=last_hidden_states)
-    store.flush()
-    dt = (time.time() - t0) * 1000
-    print(f"\n  PUT key={key} ({dt:.1f} ms)")
-    print(f"    shapes: {metadata['shapes']}")
-
-    # GET
-    t0 = time.time()
-    output = store.get(key=key, shapes=metadata["shapes"], dtypes=metadata["dtypes"], device=torch.device("cpu"))
-    dt = (time.time() - t0) * 1000
-    print(f"  GET key={key} ({dt:.1f} ms)")
-    print(f"    hidden_states:      {output.hidden_states.shape}")
-    print(f"    input_ids:          {output.input_ids.shape}")
-    if output.last_hidden_states is not None:
-        print(f"    last_hidden_states: {output.last_hidden_states.shape}")
-
-    # Verify
-    hs_ok = torch.allclose(hidden_states.float(), output.hidden_states.float(), atol=1e-2)
-    ids_ok = torch.equal(input_ids, output.input_ids)
-    print(f"\n  Integrity: hidden_states={'OK' if hs_ok else 'FAIL'}, input_ids={'OK' if ids_ok else 'FAIL'}")
-
-    # REMOVE
-    store.remove_eagle3_tensors(key=key, has_last_hidden_states=True)
-    print(f"  REMOVE queued (deferred delete).")
-
-    store.close()
-    return hs_ok and ids_ok
-
-
-# ─── Stage 3: Full vLLM pipeline ──────────────────────────────
-
-def stage3_vllm(args):
-    header("Stage 3: vLLM prefill → KV connector → Mooncake → verify")
-
-    import torch
-    from vllm import LLM, SamplingParams
-    from verl.utils.mooncake.config import MooncakeConfig
-
-    # Setup Mooncake env vars (vLLM workers read these)
-    mc_config = MooncakeConfig.from_master_address(
-        master_host=args.master_host,
-        master_port=args.master_port,
-        metadata_port=args.metadata_port,
-        protocol="tcp",
-    )
-    mc_config.export_env()
-    print(f"  Mooncake env exported: {mc_config.master_server_address}")
-
-    # Resolve aux layer IDs
-    if args.aux_layers:
-        aux_layer_ids = [int(x) for x in args.aux_layers.split(",")]
+    # ── Step 1: Launch master ──
+    master_proc = None
+    if not args.skip_master:
+        print("\n[1/4] Launching mooncake_master...")
+        lease_ttl_ms = int(args.lease_ttl * 1000)
+        master_proc = launch_master(port=args.master_port, http_port=args.metadata_port, lease_ttl_ms=lease_ttl_ms)
     else:
-        from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        cfg = getattr(cfg, "text_config", cfg)
-        n = cfg.num_hidden_layers
-        aux_layer_ids = [1, n // 2 - 1, n - 4]
-        if n - 1 not in aux_layer_ids:
-            aux_layer_ids.append(n - 1)
-    print(f"  aux_layer_ids: {aux_layer_ids}")
+        print("\n[1/4] Skipping master launch (--skip-master)")
 
-    # Create vLLM engine
-    print(f"  Creating vLLM LLM (model={args.model_path}, tp={args.tp_size})...")
-    t0 = time.time()
-    engine = LLM(
-        model=args.model_path,
-        tensor_parallel_size=args.tp_size,
-        trust_remote_code=True,
-        speculative_config={
-            "method": "extract_hidden_states",
-            "num_speculative_tokens": 1,
-            "draft_model_config": {
-                "hf_config": {
-                    "eagle_aux_hidden_state_layer_ids": aux_layer_ids,
-                }
-            },
-        },
-        kv_transfer_config={
-            "kv_connector": "MooncakeHiddenStatesConnector",
-            "kv_connector_module_path": "verl.utils.mooncake.hidden_states_connector",
-            "kv_role": "kv_producer",
-        },
-    )
-    print(f"  Engine created in {time.time()-t0:.1f}s")
+    # ── Step 2-4: Run test ──
+    try:
+        ok = run_test(args)
+    finally:
+        # Close stores BEFORE killing master to avoid segfault in C++ destructors
+        if master_proc and master_proc.poll() is None:
+            print("\n[cleanup] Stopping mooncake_master...")
+            time.sleep(0.5)  # let C++ destructors finish
+            master_proc.terminate()
+            try:
+                master_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                master_proc.kill()
 
-    # Prefill request
-    print(f"\n  Sending prefill request: {args.prompt!r}")
-    t0 = time.time()
-    outputs = engine.generate([args.prompt], SamplingParams(max_tokens=1, temperature=0))
-    dt = (time.time() - t0) * 1000
-    print(f"  generate() completed in {dt:.1f} ms")
-
-    ok = True
-    for i, output in enumerate(outputs):
-        kv_params = getattr(output, "kv_transfer_params", None)
-        n_prompt = len(output.prompt_token_ids)
-        generated = output.outputs[0].text if output.outputs else ""
-
-        print(f"\n  Output {i}:")
-        print(f"    prompt_tokens: {n_prompt}")
-        print(f"    generated: {generated!r} (discarded — prefill only)")
-
-        if kv_params is None:
-            print(f"    kv_transfer_params: NONE — connector may not have fired")
-            ok = False
-            continue
-
-        mooncake_key = kv_params.get("mooncake_key", "?")
-        shapes = kv_params.get("tensor_shapes", {})
-        dtypes = kv_params.get("tensor_dtypes", {})
-        print(f"    mooncake_key: {mooncake_key}")
-        print(f"    shapes: {shapes}")
-        print(f"    dtypes: {dtypes}")
-
-        # Verify Mooncake read
-        if shapes:
-            print(f"\n  Verifying Mooncake read...")
-            from verl.utils.mooncake.eagle_store import EagleMooncakeStore
-            store = EagleMooncakeStore(mc_config)
-            store.setup()
-
-            dtype_map = {"bfloat16": torch.bfloat16, "int64": torch.int64, "float32": torch.float32}
-            torch_dtypes = {k: dtype_map.get(str(v), torch.bfloat16) for k, v in dtypes.items()}
-            torch_shapes = {k: tuple(v) if isinstance(v, list) else v for k, v in shapes.items()}
-
-            result = store.get(key=mooncake_key, shapes=torch_shapes, dtypes=torch_dtypes, device=torch.device("cpu"))
-            print(f"    hidden_states:      {result.hidden_states.shape} ({result.hidden_states.dtype})")
-            print(f"    input_ids:          {result.input_ids.shape} ({result.input_ids.dtype})")
-            if result.last_hidden_states is not None:
-                print(f"    last_hidden_states: {result.last_hidden_states.shape} (pre-norm)")
-            print(f"    Mooncake read: OK")
-
-            # Cleanup
-            store.remove_eagle3_tensors(mooncake_key, has_last_hidden_states="last_hidden_states" in shapes)
-            store.close()
-
-    del engine
-    return ok
-
-
-# ─── Main ─────────────────────────────────────────────────────
-
-def main():
-    args = parse_args()
-    stages = [1, 2, 3] if args.stage == "all" else [int(args.stage)]
-    results = {}
-
-    if 1 in stages:
-        results[1] = stage1_imports()
-
-    if 2 in stages:
-        results[2] = stage2_mooncake(args)
-
-    if 3 in stages:
-        results[3] = stage3_vllm(args)
-
-    header("Results")
-    for s, ok in results.items():
-        print(f"  Stage {s}: {'PASSED' if ok else 'FAILED'}")
-
-    if not all(results.values()):
-        sys.exit(1)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

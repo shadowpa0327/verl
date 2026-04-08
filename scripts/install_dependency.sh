@@ -119,7 +119,7 @@ $PIP --no-deps "trl==0.27.0"
 # Mooncake (for drafter co-training)
 # ---------------
 echo ">>> Installing mooncake..."
-$PIP mooncake || echo "WARNING: mooncake install failed (may need system RDMA libs). Drafter co-training requires this."
+$PIP mooncake-transfer-engine || echo "WARNING: mooncake install failed (may need system RDMA libs). Drafter co-training requires this."
 
 # ----------------
 # verl (editable)
