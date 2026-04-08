@@ -45,7 +45,26 @@ RayPPOTrainer (driver)
 - **Mooncake** as data plane — heavy tensors (hidden states) flow through Mooncake KV store. The 3-level pipeline only routes lightweight metadata (keys, shapes).
 - **DrafterDataController on driver** — mirrors verl's single-controller pattern. Levels 1 & 2 are global; Level 3 dispatch via `DataProto.chunk()` + drafter mesh.
 - **No unanimity gate** — the centralized controller + mesh dispatch guarantees all ranks get data or none do. Consensus by construction.
-- **Pre-norm trade-off** — vLLM captures `last_hidden_states` before final RMSNorm. The Forward KL loss already includes explicit RMSNorm, so this is handled.
+- **Pre-norm handling** — vLLM captures `last_hidden_states` before the final RMSNorm (pre-norm). `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` (a frozen copy of the actor's `model.norm`) to normalize before target distribution computation. Note: the loss kernel's built-in RMSNorm is for the *draft* model's norm, not the verifier — these are separate.
+
+### TorchSpec Reference (Source Knowledge)
+
+The verl drafter pipeline is ported from TorchSpec. Reference material:
+
+| Location | What |
+|---|---|
+| `reference/TorchSpec/` | Full TorchSpec source code |
+| `reference/torch_spec_docs/Eagle3-Co-Trained/` | 9 design docs covering architecture, data flow, code maps |
+
+**Key TorchSpec internals to understand:**
+- **Eagle3 architecture**: 4 trainable components: `fc` (3*D→D) + `midlayer` (1 decoder layer) + `norm` (RMSNorm) + `lm_head` (D→V). ~140M params for 7B target. Only `embed_tokens` is frozen (from target, `requires_grad=False` at `base.py:191`). `lm_head` is the draft model's own trainable projection — NOT frozen, NOT shared from target. See `torchspec/models/draft/llama3_eagle.py:1737-1797`.
+- **7-step TTT loop**: Each step predicts `i` positions ahead, KV cache accumulates, losses weighted 0.8^i. See `torchspec/models/eagle3.py:192-239`.
+- **Forward KL loss**: NOT cross-entropy. Fused `torch.compile`: RMSNorm → lm_head → `-(target_p * log_softmax(logits)).sum(-1).mean()`. Two variants for vocab pruning vs lazy target. See `torchspec/models/ops/loss.py`.
+- **Controller**: 4 FIFO stores (`_stored_dataset` → `prompt_buffer` → `sample_pool` → `train_queues[]`). Only routes metadata; tensors in Mooncake. See `torchspec/controller/training_controller.py`.
+- **KV Connector**: Scheduler-side (pre-compute metadata) and Worker-side (KV cache extract → Mooncake) — **they do NOT share state**. See `torchspec/inference/engine/mooncake_hidden_states_connector.py`.
+- **Module sharing**: Only `embed_tokens` is frozen from target (for draft input). `target_lm_head` + `verifier_norm` loaded separately from target (for computing target distribution). `fc` + `midlayer` + `norm` + `lm_head` are all trainable, part of the draft model. The draft's `lm_head` is distinct from `target_lm_head`.
+- **verifier_norm**: vLLM captures pre-norm last_hs. In verl, `FSDPDrafterEngine._verifier_norm` (frozen copy of actor's `model.norm`) is applied in `prepare_model_inputs()` before target construction. TorchSpec equivalent: `eagle3_trainer.py:239-241`.
+- **target_lm_head_weight**: Stored as `FSDPDrafterEngine._target_lm_head_weight` (frozen clone of actor's `lm_head.weight`). Used in `prepare_model_inputs()` → `compute_lazy_target_padded()` to build `LazyTarget`. Distinct from the draft model's `lm_head` which is used for draft logits in the loss kernel.
 
 ### Migration Files (branch `feat/drafter-cotraining`)
 
@@ -61,11 +80,13 @@ RayPPOTrainer (driver)
 
 ### Key Documents
 
-| Doc | What |
-|---|---|
-| `claude_docs/rfc-drafter-trainer-integration.md` | Approved RFC — full design with data lifecycle, dispatch mechanism, worker hierarchy |
-| `claude_docs/migration-status.md` | File-by-file status, import mappings, verification checklist |
-| `claude_docs/torchspec-to-verl-migration-map.md` | TorchSpec → verl file mapping, priority order |
+| Doc | Role | What |
+|---|---|---|
+| `claude_docs/migration-status.md` | **Current state** | What's done, what's TODO (ordered), frozen module sync, verification checklist |
+| `claude_docs/rfc-drafter-trainer-integration.md` | **Design (locked)** | Why: 3-level pipeline, DrafterDataController, sleep/wake, dispatch mechanism |
+| `claude_docs/torchspec-to-verl-migration-map.md` | **Reference** | TorchSpec internals + file-by-file connection map to verl |
+| `reference/torch_spec_docs/Eagle3-Co-Trained/` | **Source docs** | 9 TorchSpec design docs (Eagle3 training, controller, data flow, code maps) |
+| `reference/TorchSpec/torchspec/` | **Source code** | Full TorchSpec source — the upstream reference implementation |
 
 ### Testing
 
@@ -212,4 +233,4 @@ Core principles: **Simplicity First** | **No Laziness** (root causes only) | **M
 - Don't use too many try-catch unless necessary.
 - Use `tasks` to maintain todos.
 - No unanimity gate needed — controller pattern guarantees consensus by construction.
-- vLLM captures pre-norm last_hidden_states — `compiled_forward_kl_loss` handles this with explicit RMSNorm.
+- vLLM captures pre-norm last_hidden_states — `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` before target construction. The loss kernel's RMSNorm is for the draft model's own norm (separate concern).

@@ -1,366 +1,162 @@
 # TorchSpec → verl Migration Map
 
-Maps TorchSpec source files to verl migration targets based on the approved RFC.
+Maps TorchSpec source files to verl migration targets. Includes TorchSpec internals knowledge, file-by-file connections, and current wired/TODO status.
 
-## Overview
-
-```
-TorchSpec (async, Ray actors)          verl (sync, single-controller)
-─────────────────────────              ───────────────────────────────
-
-AsyncTrainingController ─────────────→ DrafterDataController (on driver)
-AsyncInferenceManager ───────────────→ (not needed — driver orchestrates)
-VllmEngine + KV Connector ───────────→ HS Collector vLLM worker (no patching)
-EagleMooncakeStore ──────────────────→ Mooncake integration in verl
-MooncakeDataFetcher ─────────────────→ Folded into update_drafter()
-TrainerActor / Eagle3Trainer ────────→ FSDPDrafterEngine + TrainingWorker
-training_loop() ─────────────────────→ RayPPOTrainer.fit() orchestration
-```
+**Reference docs:** `reference/torch_spec_docs/Eagle3-Co-Trained/` (9 design docs), `reference/TorchSpec/` (full source)
 
 ---
 
-## File-by-File Mapping
+## TorchSpec Internals — Quick Reference
 
-### 1. Controller: `torchspec/controller/training_controller.py`
+### What TorchSpec Is
+EAGLE3 speculative decoding drafter co-training framework. Trains a tiny drafter (~2% of target size) to predict the target model's output distribution via Forward KL distillation.
 
-**What it does:** Central hub — owns 4 FIFO stores (prompt_buffer, sample_pool, train_queues, eval_pool). Routes metadata between inference and training. CPU-only Ray actor.
+### EAGLE3 Architecture
+4 trainable components: `fc` (Linear 3*D → D), `midlayer` (1 decoder layer), `norm` (RMSNorm), `lm_head` (Linear D → V). ~140M params for 7B target.
 
-**Key interfaces to port:**
-- `push_inference_results(results)` — fills sample_pool with InferenceOutput (mooncake_key + metadata)
-- `try_dispatch_batch()` — pops from sample_pool, partitions round-robin, pushes to train_queues
-- `get_prompts(n)` — drains prompt_buffer for inference
-- `_partition_results(results, dp_size)` — round-robin partition
+**Module inventory:**
 
-**verl target:** `DrafterDataController` (in-process on RayPPOTrainer, not a Ray actor)
-
-**What changes:**
-- TorchSpec: Ray actor with threading locks, async polling
-- verl: Simple Python object, synchronous, no locks needed
-- TorchSpec: 4 stores (dataset, prompt_buffer, sample_pool, train_queues)
-- verl: 2 stores (raw_prompts, sample_pool) — Level 3 handled by mesh dispatch
-- TorchSpec: `try_dispatch_batch()` pushes to Ray Queues
-- verl: `drain_as_dataproto()` packs into DataProto, mesh dispatch splits per rank
-
-**What to reference/copy:**
-- Partition logic (`_partition_results`) — though verl's DataProto.chunk() replaces this
-- Pool size tracking for backpressure (if needed later)
-- Status/monitoring interface (`get_status()`, `get_speeds()`)
-
----
-
-### 2. Inference Manager: `torchspec/controller/inference_manager.py`
-
-**What it does:** Async event loop — continuously pulls prompts from controller, dispatches to SGLang engines, collects results, pushes back to controller. Handles backpressure (pauses when sample_pool too large).
-
-**verl target:** NOT NEEDED as a separate component
-
-**Why:** verl is synchronous. The driver (RayPPOTrainer) directly:
-1. Sends sequences to HS collector workers via mesh dispatch
-2. Collects results via mesh collect
-3. Pushes metadata into DrafterDataController
-
-The driver IS the inference manager in verl's sync model.
-
-**What to reference:**
-- Backpressure logic (`_await_pool_capacity`) — useful if we add buffer limits later
-- Metrics collection (`MetricsCollector`) — throughput tracking
-
----
-
-### 3. VllmEngine + KV Connector: `torchspec/inference/engine/mooncake_hidden_states_connector.py`
-
-**What it does:** `KVConnectorBase_V1` subclass that intercepts vLLM model forward and writes hidden states to Mooncake. No patching of vLLM internals — uses the official KV Connector plugin interface.
-
-**Key code:**
-```python
-class MooncakeHiddenStatesConnector(KVConnectorBase_V1):
-    def save_hidden_states(self, hidden_states, input_ids, ...):
-        # Called from vLLM model runner after prefill forward
-        # Async DtoH + Mooncake.put()
-        # Returns: mooncake_key, tensor_shapes, tensor_dtypes
-```
-
-**verl target:** `self.hs_collector` in ActorRolloutRefDrafterWorker — a new vLLM instance (BaseRollout) configured with this KV connector for prefill-only mode
-
-**What changes:**
-- TorchSpec: Standalone Ray actor, manages own GPU lifecycle
-- verl: Colocated with rollout on same GPU, sleep/wake time-multiplexed
-- TorchSpec: Multi-engine pool with round-robin (`EnginePool`)
-- verl: Single HS collector instance per worker (same DP topology as rollout)
-
-**What to port:**
-- `mooncake_hidden_states_connector.py` — copy mostly as-is, plug in via vLLM `--kv-connector` flag
-- generate() call pattern (prefill-only, return mooncake_key + metadata)
-- Mooncake store setup registered within the connector
-
-**Key advantage:** No patching of vLLM internals. The KV Connector interface is stable and officially supported.
-
-> **Warning — pre-norm last_hidden_states:** vLLM returns `last_hidden_states` *before* the final RMSNorm layer. The Eagle3 drafter training must account for this: either apply RMSNorm as a preprocessing step or adapt the loss accordingly.
-
----
-
-### 4. SGLang Patches: `patches/sglang/v0.5.8.post1/sglang.patch` — **Skipped — using vLLM instead**
-
-**Status:** This section is skipped. The migration pivoted to vLLM + KV Connector, which requires no SGLang patching.
-
-**Original plan (for reference only):** Would have patched sglang internals to capture hidden states during prefill and write to Mooncake.
-
-| File patched | What was planned |
-|---|---|
-| `engine.py` | `spec_training_data_id`, `packed_loss_mask` fields on generate() |
-| `io_struct.py` | New fields in `GenerateReqInput` for spec_training mode |
-| `scheduler_output_processor_mixin.py` | Hidden states extraction, target logits, Mooncake put |
-| `model_runner.py` | Capture aux hidden states at specified layer IDs |
-| `logits_processor.py` | Skip sampling in spec_training mode |
-| `spec_training_info.py` | New data structure tracking spec_training through pipeline |
-
-**Why skipped:** vLLM's `KVConnectorBase_V1` achieves the same without any patching, and verl already has vLLM integration in its rollout registry.
-
----
-
-### 5. Mooncake Store: `torchspec/transfer/mooncake/`
-
-**Files:**
-- `store.py` — `MooncakeHiddenStateStore` (base: setup, register buffers, RDMA/TCP)
-- `eagle_store.py` — `EagleMooncakeStore` (Eagle3: put/get/remove for HS, logits, input_ids)
-- `buffers.py` — `HostBufferPool`, `GPUSendBuffer`, `GPUReceiveBuffer`
-- `deferred_delete.py` — `DeferredDeleteManager` (async cleanup)
-
-**Key interfaces:**
-```python
-class EagleMooncakeStore:
-    def put(self, key, hidden_states, target_logits, input_ids, ...):
-        # Async DtoH copy on _copy_stream
-        # batch_put_from to Mooncake via RDMA/TCP
-        # Returns: {shapes, dtypes} metadata dict
-    
-    def get(self, key, shapes, dtypes):
-        # batch_get_into from Mooncake → GPU buffer
-        # Returns: dict of tensors on GPU
-    
-    def remove_eagle3_tensors(self, key):
-        # Deferred delete via DeferredDeleteManager
-    
-    def flush(self):
-        # Block until all in-flight puts complete
-```
-
-**Storage format per sample:**
-- `{key}_hs` — hidden_states (bfloat16)
-- `{key}_tgt` — target logits (bfloat16)
-- `{key}_ids` — input_ids
-- `{key}_lhs` — last_hidden_states (optional)
-
-**verl target:** Can be used mostly as-is, or adapted into a verl utility module
-
-**What to port:**
-- `EagleMooncakeStore` — the main put/get/remove interface
-- `HostBufferPool` — RDMA-registered buffer management
-- `DeferredDeleteManager` — async cleanup (or simplify to sync for V1)
-- Configuration: `MooncakeConfig` (protocol, device, buffer sizes, TTL)
-
-**What might change:**
-- verl's colocated model may allow simpler buffer management (same GPU)
-- GPU Direct may not be needed in V1 (same-node, CPU buffer sufficient)
-- Could start with TCP protocol, upgrade to RDMA later
-
----
-
-### 6. Data Fetcher: `torchspec/training/data_fetcher.py`
-
-**What it does:** Bridges Ray Queue → Mooncake → DataLoader. `MooncakeDataset` is an IterableDataset that blocks on queue.get(), loads tensors from Mooncake, and yields training batches.
-
-**Key code:**
-```python
-class MooncakeDataset(IterableDataset):
-    def __iter__(self):
-        while True:
-            sample = self.ray_queue.get()  # blocks
-            if sample is None: break       # sentinel
-            tensors = self._load_from_mooncake(sample)
-            self._cleanup_mooncake_data(sample.mooncake_key)
-            yield tensors
-
-class MooncakeDataFetcher:
-    def __init__(self, queue, mooncake_store, collator, ...):
-        dataset = MooncakeDataset(queue, mooncake_store)
-        self.dataloader = DataLoader(dataset, collate_fn=collator, ...)
-```
-
-**verl target:** Folded into `update_drafter()` on workers — no separate DataLoader needed
-
-**Why:** In verl's sync model, the worker receives its shard of SampleMeta via mesh dispatch, then directly calls Mooncake.get() + train_batch(). No blocking queue, no DataLoader.
-
-**What to reference:**
-- `_load_from_mooncake()` — the Mooncake.get() call pattern (shapes, dtypes handling)
-- Collation logic — padding, batching of variable-length hidden states
-- Loss mask handling — `packed_loss_mask` parsing
-
----
-
-### 7. Eagle3 Model & Loss: `torchspec/models/`
-
-**Files:**
-- `eagle3.py` — `Eagle3Model` (nn.Module: PrecomputedTarget/LazyTarget forward, wraps draft model)
-- `ops/loss.py` — `compiled_forward_kl_loss`, `compiled_forward_kl_loss_from_hs` (torch.compiled fused RMSNorm + lm_head + Forward KL loss kernels)
-- `ops/loss_mask.py` — Numba-compiled loss mask computation
-- `draft/base.py` — `Eagle3DraftModelBase` (base class for trainable draft params: fc + decoder layer)
-- `draft/auto.py` — `AutoEagle3DraftModel` (auto-registry: model config → architecture-specific impl)
-- `draft/llama3_eagle.py`, `draft/deepseek_eagle.py`, etc. — Architecture-specific draft models
-
-**Key detail — loss is Forward KL, NOT cross-entropy:**
-```python
-# torchspec/models/ops/loss.py
-# Forward KL: -(target_p * log_softmax(logits)).sum(-1).mean()
-# Fused with RMSNorm + lm_head for efficiency
-```
-
-> **Warning — Forward KL loss:** The drafter loss is **forward KL divergence** (teacher → student), not cross-entropy. Do not substitute cross-entropy when porting `compiled_forward_kl_loss`. The fused kernel applies RMSNorm → lm_head → forward KL in one pass; if using vLLM's pre-norm hidden states as input, the RMSNorm step is mandatory before calling lm_head.
-
-**verl target:** Split across:
-- Draft model definitions → model for `FSDPDrafterEngine`
-- Forward KL loss → `eagle_draft_loss` for `TrainingWorker.set_loss_fn()`
-- Loss mask utilities → port or adapt
-
-**What to port:**
-- `Eagle3Model` forward pass logic
-- `compiled_forward_kl_loss` — the actual loss (Forward KL, not cross-entropy)
-- Architecture-specific draft models (at least the ones we need: e.g. Qwen, Llama)
-- `AutoEagle3DraftModel` registry pattern
-
----
-
-### 8. Trainer: `torchspec/training/`
-
-**Files:**
-- `trainer_actor.py` — `TrainerActor` (Ray actor, manages distributed training)
-- `trainer.py` — `Trainer` (base class, training loop mechanics)
-- `eagle3_trainer.py` — `Eagle3Trainer` (drives Eagle3Model, loss, optimizer)
-- `fsdp.py` — `apply_fsdp2()` (FSDP2 wrapping utilities)
-
-**verl target:** Split across:
-- `FSDPDrafterEngine` — the EAGLE model forward/backward (Layer 1)
-- `TrainingWorker` — micro-batching, loss injection (Layer 2)
-- `update_drafter()` — orchestration on worker side
-
-**What to port:**
-- Eagle3Trainer._train_step() flow → adapted into verl's train_batch pattern
-- Model initialization (shared embed_tokens/lm_head from actor)
-- Gradient accumulation / micro-batching config
-- FSDP2 wrapping approach (reference `fsdp.py`)
-
-**What changes:**
-- TorchSpec: Standalone trainer with own optimizer, scheduler, DDP
-- verl: Uses FSDP via FSDPDrafterEngine, verl manages optimizer
-
----
-
-### 8. Training Loop: `torchspec/controller/loop.py`
-
-**What it does:** Main orchestration — per optimizer step: dispatch batches → fire training → collect metrics → checkpoint → epoch management.
-
-**verl target:** Added to `RayPPOTrainer.fit()` as the drafter sub-pipeline
-
-**What changes:**
-- TorchSpec: Async loop with retry polling (sleep 10ms until data ready)
-- verl: Sync — data is always ready after HS collection completes
-- TorchSpec: Separate training_loop function
-- verl: Integrated into existing RL step in RayPPOTrainer.fit()
-
----
-
-### 10. Decode-Side: Weight Sync & Speculative Decoding
-
-**Files:**
-- `inference/engine/sgl_engine_decode.py` — `SglDecodeEngineMixin` (speculative decoding generation, `_sync_draft_weights()`)
-- `patches/sglang/v0.5.8.post1/sglang_decode.patch` — Decode-mode SGLang patches (20 files: scheduler weight sync, CUDA graph, etc.)
-
-**verl target:** Relevant for the weight sync phase (`drafter weights → rollout vLLM` in the RFC). The `_sync_draft_weights()` method shows how TorchSpec pushes updated drafter weights to the inference server for speculative decoding at rollout time.
-
-**Priority:** P2 — needed after the training pipeline works, when integrating with speculative decoding rollout.
-
----
-
-### 11. vLLM KV Connector (P0 — Primary HS Collection Path)
-
-**File:** `inference/engine/mooncake_hidden_states_connector.py`
-
-**What it does:** `KVConnectorBase_V1` subclass. Intercepts vLLM model forward during prefill and writes hidden states to Mooncake using the official KV Connector plugin interface. No patching of vLLM internals required.
-
-**verl target:** Copy into verl as the primary HS collection mechanism. Register via `--kv-connector MooncakeHiddenStatesConnector` when launching the vLLM-backed HS collector worker.
-
-> **Warning — pre-norm last_hidden_states:** vLLM's KV Connector receives `last_hidden_states` *before* the final RMSNorm. The Eagle3 forward KL loss fuses RMSNorm + lm_head, so this must be applied at training time or the connector must be configured to return post-norm states.
-
----
-
-### 12. Data Types
-
-**Files:**
-- `utils/types.py` — `InferenceInput`, `InferenceOutput`
-- `training/data_fetcher.py` — `TrainSample` (not in types.py)
-
-**Key types:**
-```python
-# torchspec/utils/types.py
-InferenceInput:  data_id, prompt, input_ids, packed_loss_mask, metadata
-InferenceOutput: data_id, mooncake_key, tensor_shapes, tensor_dtypes, packed_loss_mask
-
-# torchspec/training/data_fetcher.py
-TrainSample:     mooncake_key, tensor_shapes, tensor_dtypes, packed_loss_mask
-```
-
-**verl target:** Maps to `SequenceMeta` / `SampleMeta` in the RFC, packed into `DataProto.non_tensor_batch`
-
----
-
-### 13. Config: `torchspec/config/`
-
-**Files:**
-- `mooncake_config.py` — Mooncake connection params (protocol, RDMA device, buffer sizes)
-- `inference_config.py` — Engine config (batch size, num engines, TP, aux layers)
-- `train_config.py` — Training config (LR, warmup, accumulation, checkpoint)
-
-**verl target:** Extend verl's existing config (yaml) with drafter/mooncake sections
-
----
-
-## Priority Order for Migration
-
-| Priority | Component | TorchSpec Source | verl Target | Complexity |
+| Module | Source | Status | Role | verl location |
 |---|---|---|---|---|
-| **P0** | vLLM engine + KV Connector | `inference/engine/mooncake_hidden_states_connector.py` | Copy into verl, plug via `--kv-connector` | Low — no patching needed |
-| **P0** | Mooncake store | `transfer/mooncake/` | New verl module | Medium — copy mostly as-is |
-| **P1** | Eagle3 model & loss | `models/eagle3.py`, `models/ops/loss.py`, `models/draft/` | FSDPDrafterEngine + Forward KL loss | Medium |
-| **P1** | HS Collector worker | `inference/engine/mooncake_hidden_states_connector.py` | New BaseRollout subclass (vLLM) | Medium |
-| **P1** | DrafterDataController | `controller/training_controller.py` | New class on driver | Low |
-| **P2** | Decode-side weight sync | `inference/engine/sgl_engine_decode.py` | Weight sync for SD rollout | Medium |
-| **P2** | Orchestration | `controller/loop.py` | RayPPOTrainer.fit() additions | Low |
-| **P2** | Data fetching | `training/data_fetcher.py` | Folded into update_drafter() | Low |
-| **P3** | Config | `config/` | verl yaml extensions | Low |
-| **Skip** | InferenceManager | `controller/inference_manager.py` | Not needed (sync model) | — |
-| **Skip** | SGLang prefill patches | `patches/sglang/sglang.patch` | Using vLLM instead | — |
-| **Skip** | SGLang decode patches | `patches/sglang/sglang_decode.patch` | Using vLLM instead | — |
+| `embed_tokens` | Actor model | Frozen (weight copy, re-synced) | Token → embedding lookup for drafter input | `Eagle3Model.draft_model.embed_tokens` |
+| `fc` | **New (random init)** | **Trainable** | Fuses 3 aux layer HS: `Linear(target_hidden_size * 3, draft_hidden_size)` | `Eagle3Model.draft_model.fc` |
+| `midlayer` | **New (random init)** | **Trainable** | Single decoder layer (self-attention + MLP with KV cache) | `Eagle3Model.draft_model.midlayer` |
+| `norm` | **New (in draft model)** | **Trainable** | RMSNorm before `lm_head` projection in loss kernel | `Eagle3Model.draft_model.norm` |
+| `lm_head` | **Draft model's own** | **Trainable** | Draft hidden states → vocab logits (via `get_lm_head_params()` → `F.linear` in fused loss) | `Eagle3Model.draft_model.lm_head` |
+| `target_lm_head` | Actor model | Frozen (weight clone, re-synced) | Compute target distribution from `last_hidden_states` (in `LazyTarget` path) | `FSDPDrafterEngine._target_lm_head_weight` |
+| `verifier_norm` | Actor `model.norm` | Frozen (deepcopy, re-synced) | RMSNorm applied to pre-norm `last_hidden_states` from vLLM in `prepare_model_inputs()` | `FSDPDrafterEngine._verifier_norm` |
 
-## Files to Copy vs Rewrite
+Note: There are **two separate lm_heads**. The draft model's `lm_head` (trainable) produces draft logits. The `target_lm_head` (frozen, from actor) produces the target distribution for Forward KL. These are distinct tensors — the draft model learns its own output projection. In TorchSpec, only `embed_tokens` has `requires_grad=False` (see `base.py:191`); `lm_head` is never frozen.
 
-**Copy/adapt (minimal changes):**
-- `transfer/mooncake/eagle_store.py` — core Mooncake interface
-- `transfer/mooncake/buffers.py` — buffer pool management
-- `transfer/mooncake/deferred_delete.py` — async cleanup
-- `transfer/mooncake/helpers.py`, `utils.py` — dependencies of eagle_store
-- `models/ops/loss.py` — Forward KL loss kernels (torch.compiled)
-- `models/draft/` — draft model architectures
-- `config/mooncake_config.py` — connection config
-- `inference/engine/mooncake_hidden_states_connector.py` — vLLM KV Connector for HS capture (copy as-is, no patching required)
+**Key difference from TorchSpec:** In TorchSpec the target model is fixed (pure offline distillation). In verl the target IS the actor, and the actor trains every RL step. So frozen modules (`embed_tokens`, `target_lm_head`, `verifier_norm`) must be **re-synced after each `update_actor()`**. We do NOT use live reference sharing (fragile under FSDP resharding). Instead:
+1. At drafter init: load/copy from actor's initial weights
+2. After each `update_actor()`: copy updated weights from actor → drafter's frozen modules
 
-**Rewrite for verl patterns:**
-- `controller/training_controller.py` → `DrafterDataController` (sync, in-process, DataProto)
-- `inference/engine/sgl_engine.py` → HS Collector (BaseRollout subclass wrapping vLLM, sleep/wake)
-- `models/eagle3.py` + `training/eagle3_trainer.py` → `FSDPDrafterEngine` + `eagle_draft_loss`
-- `training/data_fetcher.py` → folded into `update_drafter()`
+### 7-Step TTT Loop (`torchspec/models/eagle3.py:192-239`)
+Each step simulates one speculative decoding draft step. Step `i` trains the drafter to predict `i` positions ahead. KV cache accumulates across steps. Losses weighted by `0.8^i` exponential decay.
 
-**Skip entirely:**
-- `controller/inference_manager.py` — async polling loop, not needed
-- `controller/loop.py` — verl has its own training loop
-- `patches/sglang/sglang.patch` — SGLang prefill patches, using vLLM instead
-- `patches/sglang/sglang_decode.patch` — SGLang decode patches, using vLLM instead
+### Forward KL Loss (`torchspec/models/ops/loss.py`)
+**Not cross-entropy.** Fused `torch.compile` kernel: RMSNorm → lm_head → Forward KL (`-(target_p * log_softmax(logits)).sum(-1).mean()`). Two variants:
+- `compiled_forward_kl_loss` — takes pre-computed target probs (vocab pruning path)
+- `compiled_forward_kl_loss_from_hs` — lazy: computes target softmax inside compiled graph
+
+### Controller Pipeline (`torchspec/controller/`)
+`AsyncTrainingController` — CPU-only Ray actor, 4 FIFO stores: `_stored_dataset` → `prompt_buffer` → `sample_pool` → `train_queues[]`. Control plane routes metadata; heavy tensors flow through Mooncake. `AsyncInferenceManager` drives engines async. `training_loop()` is sync training with async inference.
+
+### HS Collection — Two Paths
+
+| | **vLLM (used in verl)** | **SGLang (reference only)** |
+|---|---|---|
+| File | `inference/engine/vllm_engine.py` + `mooncake_hidden_states_connector.py` | `inference/engine/sgl_engine.py` + patches |
+| Method | `extract_hidden_states` speculative config + KVConnector | Monkey-patched model forward |
+| Patching | **None** | `patches/sglang/sglang.patch` |
+| Last HS | **Pre-norm** (trainer applies verifier_norm) | Post-norm |
+| Skip decode | `max_tokens=1`, dummy token discarded | `max_new_tokens=0`, fake EOS |
+| Connector | Scheduler-side (metadata) + Worker-side (KV cache extract → Mooncake) — **do NOT share state** | Patched scheduler calls `eagle_mooncake_store.put()` |
+
+### Mooncake Store (`torchspec/transfer/mooncake/eagle_store.py`)
+Key suffixes: `{key}_hs` (hidden_states), `{key}_ids` (input_ids), `{key}_lhs` (last_hidden_states), `{key}_tgt` (target). All bfloat16. Two paths: GPU-Direct RDMA or async host buffer. Deferred deletion respects lease TTL.
+
+### Key Data Types (`torchspec/utils/types.py`)
+- `InferenceInput`: data_id, prompt, input_ids, packed_loss_mask, metadata
+- `InferenceOutput`: data_id, mooncake_key, tensor_shapes, tensor_dtypes, packed_loss_mask
+- `TrainSample`: mooncake_key, tensor_shapes, tensor_dtypes, packed_loss_mask
+
+### Trainer Hierarchy
+`Trainer` (base: device mesh, data fetch loop, checkpointing) → `Eagle3Trainer` (model init with FSDP2, `_forward()` with target+draft, `_backward()` with 0.8^i weighting, `verifier_norm` for pre-norm, `TargetLMHead` broadcast). Batch sizes: micro_batch_size → per_dp_rank_batch_size (×sp_size) → dispatch_batch_size (×dp_size) → global_batch_size (×accumulation_steps).
+
+---
+
+## Architecture Shift: Async → Sync Single-Controller
+
+| TorchSpec | verl | Key Change |
+|---|---|---|
+| `AsyncTrainingController` (Ray actor) | `DrafterDataController` (in-process on driver) | Ray actor → plain Python object; no locks needed |
+| `AsyncInferenceManager` (Ray actor, event loop) | **Eliminated** — driver orchestrates directly | verl is synchronous; driver calls workers via RPC |
+| `training_loop()` (driver-side coordinator) | `RayPPOTrainer.fit()` + `drafter_sub_pipeline_sketch()` | Folded into existing RL loop |
+| 4 FIFO stores | 2 stores + mesh dispatch | Level 3 handled by verl's `DataProto.chunk()` |
+| Standalone Ray actor engines | Colocated on same GPU, time-multiplexed | Sleep/wake instead of separate processes |
+
+### Data Flow Comparison
+
+```
+TorchSpec (async):
+  Dataset → Controller.prompt_buffer → InferenceManager → Engine pool (round-robin)
+  → Mooncake.put() → Controller.sample_pool → train_queues[rank]
+  → MooncakeDataFetcher → DataLoader → Eagle3Trainer._forward()
+
+verl (sync, per RL step):
+  generate_sequences() → DrafterDataController.push_raw_prompts()
+  → pull_raw_prompts() → collect_hidden_states() [VllmHSCollector]
+  → Mooncake.put() → DrafterDataController.push_samples()
+  → drain_as_dataproto() → mesh dispatch → update_drafter()
+  → Mooncake.get() → Eagle3Model.forward() → Mooncake.remove()
+```
+
+---
+
+## File-by-File Connection Map
+
+### 1. Controller Layer
+
+| TorchSpec File | verl File | What Changed |
+|---|---|---|
+| `controller/training_controller.py` | `verl/trainer/drafter/controller.py` | 4 stores → 2 stores. `try_dispatch_batch()` → `drain_as_dataproto()`. Round-robin partition → `DataProto.chunk(dp_size)`. Ray actor → plain object. |
+| `utils/types.py` (`InferenceInput`/`InferenceOutput`) | `verl/trainer/drafter/controller.py` (`SequenceMeta`/`SampleMeta`) | Simplified — no packed_loss_mask, no Ray Queue serialization. |
+| `controller/loop.py` (`training_loop()`) | `verl/trainer/drafter/orchestration.py` | Async dispatch+retry loop → synchronous 3-phase block inserted into `RayPPOTrainer.fit()`. |
+| `controller/inference_manager.py` | **Skipped** | Not needed — verl driver calls `collect_hidden_states()` directly. |
+| `training/data_fetcher.py` (`MooncakeDataFetcher`) | Folded into `update_drafter()` | No DataLoader, no Ray Queue. Worker fetches from Mooncake inline. |
+
+### 2. HS Collection (Data Producer)
+
+| TorchSpec File | verl File | What Changed |
+|---|---|---|
+| `inference/engine/vllm_engine.py` (`VllmEngine`) | `verl/workers/rollout/vllm_rollout/vllm_hs_collector.py` (`VllmHSCollector`) | Nearly identical. `kv_connector_module_path` → `verl.utils.mooncake.hidden_states_connector`. Removed `RayActor` base, `InferenceEngine` base, `setup_file_logging`. |
+| `inference/engine/mooncake_hidden_states_connector.py` | `verl/utils/mooncake/hidden_states_connector.py` | Copy with import paths: `torchspec.config` → `verl.utils.mooncake.config`, `torchspec.transfer` → `verl.utils.mooncake`. |
+| Standalone Ray actor, engine pool | Colocated on same GPU, time-multiplexed via sleep/wake | Major architectural change. |
+
+### 3. Mooncake Store (Data Plane)
+
+| TorchSpec File | verl File | What Changed |
+|---|---|---|
+| `transfer/mooncake/eagle_store.py` | `verl/utils/mooncake/eagle_store.py` | Nearly identical. Same `put()`/`get()`/`remove_eagle3_tensors()` API, same key suffixes. |
+| `transfer/mooncake/store.py` | `verl/utils/mooncake/store.py` | Copy of base `MooncakeHiddenStateStore`. |
+| `transfer/mooncake/buffers.py` | `verl/utils/mooncake/buffers.py` | Copy — `HostBufferPool`, `GPUSendBuffer`, `GPUReceiveBuffer`, `AsyncPutManager`. |
+| `transfer/mooncake/deferred_delete.py` | `verl/utils/mooncake/deferred_delete.py` | Copy — `DeferredDeleteManager`. |
+| `config/mooncake_config.py` | `verl/utils/mooncake/config.py` | Copy — `MooncakeConfig`. |
+| N/A | `verl/utils/mooncake/master.py` | **New** — verl manages its own Mooncake master process. |
+
+### 4. Eagle3 Model & Loss (Training Core)
+
+| TorchSpec File | verl File | What Changed |
+|---|---|---|
+| `models/eagle3.py` (`Eagle3Model`) | `verl/models/eagle3/eagle3_model.py` | Nearly identical TTT loop. Minor: `maybe_mark_dynamic` → `mark_dynamic`, `padding` utility inlined. |
+| `models/ops/loss.py` | `verl/models/eagle3/ops/loss.py` | Identical — `compiled_forward_kl_loss`, `compiled_forward_kl_loss_from_hs`. |
+| `models/ops/loss_mask.py` | `verl/models/eagle3/ops/loss_mask.py` | Copy. |
+| `models/draft/llama3_eagle.py` | `verl/models/eagle3/draft/llama3_eagle.py` | Copy — fc + midlayer + shared embed/lm_head. |
+| `models/draft/auto.py` | `verl/models/eagle3/draft/auto.py` | Copy — `AutoEagle3DraftModel` factory. |
+| `models/draft/base.py` | `verl/models/eagle3/draft/base.py` | Copy — `Eagle3DraftModel` abstract base. |
+
+### 5. Trainer & Engine (Training Orchestration)
+
+| TorchSpec File | verl File | What Changed |
+|---|---|---|
+| `training/eagle3_trainer.py` → `init_model()` | `FSDPDrafterEngine.initialize()` + `sync_frozen_modules_from_actor()` | EngineRegistry. `initialize()` wraps `Eagle3Model(draft_model, length=7)`. Frozen modules copied from actor (not refs). |
+| `training/eagle3_trainer.py` → `_forward()` (target construction) | `FSDPDrafterEngine.prepare_model_inputs()` | Applies `verifier_norm` to pre-norm last_hs, builds `LazyTarget` via `compute_lazy_target_padded()`. |
+| `training/eagle3_trainer.py` → `_forward()` (model call) | `Eagle3Model.forward()` via `self.module(**inputs)` | 7-step TTT loop, unchanged from TorchSpec. |
+| `training/eagle3_trainer.py` → `_backward()` | **TODO** — wire via `TrainingWorker.set_loss_fn()` or in `update_drafter()` | 0.8^i weighting not yet connected. |
+| `training/trainer.py` (`Trainer` base) | `verl/workers/engine_workers.py` (`TrainingWorker`) | verl's generic worker replaces TorchSpec's base. Provides `train_batch()`, `set_loss_fn()`, micro-batching. |
+| `training/trainer_actor.py` (`TrainerActor`) | `ActorRolloutRefDrafterWorker` | Ray actor → verl's `@register` decorator with mesh dispatch. |
+
+### 6. Worker Integration (verl-only — no TorchSpec equivalent)
+
+| verl File | Purpose | TorchSpec Equivalent |
+|---|---|---|
+| `verl/workers/drafter_workers.py` | `ActorRolloutRefDrafterWorker`: single worker owns actor, ref, rollout, hs_collector, drafter | TorchSpec uses separate Ray actors for each role |
+| `verl/workers/engine/fsdp/drafter_impl.py` | `FSDPDrafterEngine`: wraps `Eagle3Model` with FSDP, copies frozen modules from actor, handles target construction in `prepare_model_inputs()` | Split across `eagle3_trainer.py` init + `fsdp.py` setup |
+
+---
+
+## Current Status
+
+For what's done, what's TODO, and verification checklist, see **`claude_docs/migration-status.md`** (single source of truth).

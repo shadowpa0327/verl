@@ -602,11 +602,12 @@ class FSDPDrafterEngine(FSDPEngine):
     """
     Engine for drafter models (EAGLE).
     Tiny (~2% of target params): fc + 1 decoder layer.
-    Borrows embed_tokens/lm_head from actor (frozen, shared refs).
+    Frozen modules (embed_tokens, lm_head, verifier_norm) copied from actor.
+    Re-synced after each update_actor() — not live refs (FSDP-safe).
     """
 
-    def set_shared_modules(self, embed_tokens, lm_head):
-        """Set shared frozen modules from target model."""
+    def sync_frozen_modules_from_actor(self, actor_embed_tokens, actor_lm_head, actor_norm=None):
+        """Copy frozen weights from actor (not refs). Re-call after each update_actor()."""
         ...
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
@@ -618,17 +619,17 @@ class FSDPDrafterEngine(FSDPEngine):
 
 ## Open Questions
 
-1. **Mooncake setup**: How to initialize Mooncake store in verl's existing infrastructure? Per-node or global?
+1. ~~**Mooncake setup**~~ **RESOLVED**: `MooncakeMaster` Ray actor in `verl/utils/mooncake/master.py`. Per-node store instances, global master.
 
-2. **Drafter DP mesh**: The drafter trains as pure DP. How to register its dispatch mesh for the per-rank queue consumption?
+2. ~~**Drafter DP mesh**~~ **RESOLVED**: Pure DP mesh registered via `_register_dispatch_collect_info(mesh_name="drafter", dp_rank=dist.get_rank())` in `drafter_workers.py`. Dispatch uses `make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter")`.
 
-3. **embed_tokens / lm_head sharing**: Drafter borrows these from actor. After `update_actor()`, verify FSDP doesn't invalidate the shared reference.
+3. ~~**embed_tokens / lm_head sharing**~~ **RESOLVED**: No live reference sharing. `sync_frozen_modules_from_actor()` copies weights (not refs) at init and after each `update_actor()`. Safe under FSDP resharding. Includes `embed_tokens`, `lm_head`, `verifier_norm`, `target_lm_head_weight`.
 
-4. **MooncakeHiddenStatesConnector interface**: Pin down the exact vLLM KV connector API (`send_kv_caches_and_hidden_states` / `recv_kv_caches_and_hidden_states`) and confirm the `extract_hidden_states` speculative config is sufficient to bypass sampling entirely.
+4. ~~**MooncakeHiddenStatesConnector interface**~~ **RESOLVED**: Uses vLLM's `KVConnectorBase_V1` with `save_kv_layer()` (worker-side) and `build_connector_meta()`/`request_finished()` (scheduler-side). Ported to `verl/utils/mooncake/hidden_states_connector.py`.
 
-5. **Pre-norm impact**: Assess whether using pre-RMSNorm `last_hidden_states` (vLLM trade-off) degrades drafter acceptance rates vs post-norm hidden states.
+5. **Pre-norm impact**: Still open. Using pre-RMSNorm `last_hidden_states` from vLLM. The `verifier_norm` (frozen copy of `model.norm`) is applied before target logit computation. Need empirical validation that this doesn't degrade drafter acceptance rates vs SGLang's post-norm path.
 
-6. **Buffer sizing**: How large should raw_prompts and sample_pool be? Bounded with eviction, or sized exactly for one RL step's worth of data?
+6. ~~**Buffer sizing**~~ **RESOLVED**: Sized exactly for one RL step's worth of data. `raw_prompts` and `sample_pool` drain completely each step (sync model — no buffering across steps).
 
 ---
 
