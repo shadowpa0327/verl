@@ -22,8 +22,7 @@ import torch
 from omegaconf import DictConfig
 
 from verl.protocol import DataProto
-from verl.single_controller.base import register
-from verl.single_controller.base.decorator import Dispatch
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.workers.engine_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__name__)
@@ -114,15 +113,44 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             from verl.models.eagle3.ops.loss import compiled_forward_kl_loss
             self.drafter.set_loss_fn(compiled_forward_kl_loss)
 
-        # Share embed_tokens/lm_head from actor (frozen refs, zero copy)
-        if self.actor is not None and hasattr(self.drafter.engine, "set_shared_modules"):
-            self.drafter.engine.set_shared_modules(
-                embed_tokens=self.actor.engine.module.model.embed_tokens,
-                lm_head=self.actor.engine.module.lm_head,
-            )
-            logger.info("Drafter shares embed_tokens/lm_head from actor (frozen)")
+        # Initial sync of frozen modules (embed_tokens, lm_head) from actor.
+        # These are weight copies, not references — must be re-synced after
+        # each update_actor() since the actor trains every RL step.
+        self._sync_drafter_frozen_modules()
 
         logger.info("Drafter TrainingWorker initialized")
+
+    def _sync_drafter_frozen_modules(self):
+        """Copy frozen weights from actor into drafter.
+
+        Syncs: embed_tokens, target_lm_head_weight, verifier_norm (final RMSNorm).
+        All frozen (requires_grad=False). embed_tokens for drafter input,
+        target_lm_head_weight for target distribution, verifier_norm for
+        pre-norm correction. The drafter's own lm_head is trainable and NOT synced.
+
+        Called at init and after each update_actor(). In verl the actor trains
+        every RL step (unlike TorchSpec where the target is fixed), so the
+        drafter's frozen copies must stay synchronized.
+        """
+        if self.actor is None or self.drafter is None:
+            return
+        if not hasattr(self.drafter.engine, "sync_frozen_modules_from_actor"):
+            return
+
+        actor_module = self.actor.engine.module
+
+        # Get actor's final norm (model.norm — the RMSNorm before lm_head).
+        # This is the "verifier_norm" needed because vLLM captures
+        # last_hidden_states pre-norm.
+        actor_norm = None
+        if hasattr(actor_module, "model") and hasattr(actor_module.model, "norm"):
+            actor_norm = actor_module.model.norm
+
+        self.drafter.engine.sync_frozen_modules_from_actor(
+            actor_embed_tokens=actor_module.model.embed_tokens,
+            actor_lm_head=actor_module.lm_head,
+            actor_norm=actor_norm,
+        )
 
     # ── HS Collection ─────────────────────────────────────────
 
@@ -161,7 +189,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     # ── Drafter Training ──────────────────────────────────────
 
-    @register(dispatch_mode="make_nd_compute_dataproto_dispatch_fn:drafter")
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter"))
     def update_drafter(self, data: DataProto):
         """Train drafter on this rank's shard of hidden states data.
 
@@ -213,11 +241,17 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         """Sync actor + drafter weights to rollout + HS collector.
 
         Extended from parent to also:
-        1. Sync actor weights to HS collector (same weights as rollout)
-        2. Sync drafter weights to rollout (for speculative decoding)
+        1. Re-sync frozen modules (embed_tokens, lm_head) from actor → drafter
+           (actor weights changed during update_actor())
+        2. Sync actor weights to HS collector (same weights as rollout)
+        3. Sync drafter weights to rollout (for speculative decoding)
         """
         # Actor → rollout (inherited)
         await super().update_weights()
+
+        # Actor → drafter frozen modules (embed_tokens, lm_head changed after training)
+        if self.drafter is not None:
+            self._sync_drafter_frozen_modules()
 
         if self.hs_collector is not None:
             # Actor → HS collector (same weights, separate server)

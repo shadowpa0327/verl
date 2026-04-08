@@ -1079,13 +1079,21 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaYarnRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=rope_get("rope_theta", getattr(self.config, "rope_theta", 10000)),
                     original_max_position_embeddings=rope_get("original_max_position_embeddings"),
                     scaling_factor=scaling_factor,
                     beta_fast=rope_get("beta_fast"),
                     beta_slow=rope_get("beta_slow"),
                     mscale=rope_get("mscale"),
                     mscale_all_dim=rope_get("mscale_all_dim"),
+                )
+            elif scaling_type == "default":
+                # HuggingFace normalizes rope_scaling=None into {"rope_type": "default"}.
+                # Treat as no scaling.
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=rope_get("rope_theta", getattr(self.config, "rope_theta", 10000)),
                 )
             else:
                 raise ValueError(f"Unknown RoPE scaling type {scaling_type}")

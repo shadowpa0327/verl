@@ -2,21 +2,41 @@
 FSDPDrafterEngine — FSDP engine for EAGLE drafter model training.
 
 Registered as model_type="drafter_model" in the EngineRegistry.
-Wraps the EAGLE draft model (fc + 1 decoder layer, ~2% of target params)
+
+This engine manages the Eagle3Model (7-step TTT loop wrapping a draft model)
 with FSDP for distributed training.
 
-Key differences from FSDPEngineWithLMHead:
-- Loads EAGLE draft model (not the full target model)
-- Borrows embed_tokens/lm_head from actor (frozen, shared refs)
-- Only FSDP-wraps the trainable params (fc + decoder layer)
-- Uses Forward KL loss (not cross-entropy)
-- prepare_model_inputs() expects hidden_states (from Mooncake) + input_ids
+Relationship to Eagle3Model:
+    FSDPDrafterEngine is verl infrastructure (FSDP, optimizer, device mgmt).
+    Eagle3Model is the model (7-step TTT forward, Forward KL loss).
+    The engine holds Eagle3Model as self.module — same pattern as
+    FSDPEngine holding LlamaForCausalLM for the actor.
+
+    FSDPDrafterEngine (verl)
+      └── self.module = Eagle3Model (from torchspec, pure PyTorch)
+            └── self.draft_model = LlamaForCausalLMEagle3
+                  ├── embed_tokens  (frozen, copied from actor)
+                  ├── fc            (trainable)
+                  ├── midlayer      (trainable, FSDP-sharded)
+                  ├── norm          (trainable)
+                  └── lm_head       (trainable, draft model's own)
+
+Frozen modules (embed_tokens, verifier_norm, target_lm_head_weight):
+    Copied from actor weights (not live references — safe under FSDP).
+    Must be re-synced after each update_actor() since the actor trains
+    every RL step. Call sync_frozen_modules_from_actor() at init and
+    after each actor update.
+
+    Note: lm_head is NOT frozen. Per TorchSpec, the draft model has its
+    own trainable lm_head (for draft logits in the loss kernel), separate
+    from target_lm_head_weight (frozen, for target distribution).
 
 Usage:
     engine = EngineRegistry.new("drafter_model", "fsdp", "cuda", ...)
-    engine.set_shared_modules(embed_tokens=..., lm_head=...)
+    engine.sync_frozen_modules_from_actor(actor_embed, actor_norm)
 """
 
+import copy
 import logging
 from typing import Optional
 
@@ -35,95 +55,163 @@ class FSDPDrafterEngine(FSDPEngine):
     FSDP engine for EAGLE drafter model.
 
     Tiny model (~2% of target params): fc projection + 1 decoder layer.
-    Borrows embed_tokens/lm_head from the actor model (frozen, shared refs).
-    Trained with Forward KL loss on hidden states extracted by the HS collector.
+    Frozen modules (embed_tokens) copied from actor, re-synced after
+    each update_actor(). lm_head is trainable (draft model's own).
     """
 
     def __init__(self, model_config, engine_config, optimizer_config, checkpoint_config):
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
-        self._shared_embed_tokens = None
-        self._shared_lm_head = None
+        # Frozen modules from actor — set by sync_frozen_modules_from_actor()
+        self._verifier_norm = None           # RMSNorm for pre-norm last_hs from vLLM
+        self._target_lm_head_weight = None   # target lm_head weight for LazyTarget
 
     def initialize(self):
-        """Load the EAGLE draft model and set up FSDP.
+        """Load the EAGLE draft model, wrap in Eagle3Model, and set up FSDP.
 
-        The draft model is loaded from the checkpoint specified in model_config.
-        After loading, call set_shared_modules() to link embed_tokens/lm_head
-        from the actor model.
+        Creates:
+            self.module = Eagle3Model(draft_model, length=7)
+        Then parent's initialize() applies FSDP to self.module.
         """
-        # Load draft model using AutoEagle3DraftModel
         from verl.models.eagle3.draft.auto import AutoEagle3DraftModel, AutoDraftModelConfig
+        from verl.models.eagle3.eagle3_model import Eagle3Model
 
+        # 1. Load raw draft model (fc + midlayer + embed_tokens + lm_head + norm)
         draft_config = AutoDraftModelConfig.from_file(self.model_config.local_path)
-        self.module = AutoEagle3DraftModel.from_config(
+        draft_model = AutoEagle3DraftModel.from_config(
             draft_config,
             torch_dtype=getattr(torch, self.model_config.dtype, torch.bfloat16),
         )
 
-        # Freeze embed_tokens if present (will be replaced by shared ref)
-        if hasattr(self.module, "freeze_embedding"):
-            self.module.freeze_embedding()
+        # Freeze embedding (will be synced from actor)
+        if hasattr(draft_model, "freeze_embedding"):
+            draft_model.freeze_embedding()
 
+        # 2. Wrap in Eagle3Model — adds 7-step TTT loop
+        ttt_length = getattr(self.model_config, "ttt_length", 7)
+        self.module = Eagle3Model(draft_model, length=ttt_length)
+
+        trainable = sum(p.numel() for p in self.module.parameters() if p.requires_grad)
+        frozen = sum(p.numel() for p in self.module.parameters() if not p.requires_grad)
         logger.info(
-            "Draft model loaded: %s params (%.1fM)",
-            sum(p.numel() for p in self.module.parameters()),
-            sum(p.numel() for p in self.module.parameters()) / 1e6,
+            "Eagle3Model loaded: %s trainable, %s frozen (%.1fM total)",
+            f"{trainable:,}", f"{frozen:,}", (trainable + frozen) / 1e6,
         )
 
-        # Set up FSDP, optimizer, scheduler via parent
+        # 3. Parent applies FSDP to self.module (Eagle3Model containing draft_model)
         super().initialize()
 
-    def set_shared_modules(
+    # ------------------------------------------------------------------
+    # Frozen module sync
+    # ------------------------------------------------------------------
+
+    def sync_frozen_modules_from_actor(
         self,
-        embed_tokens: torch.nn.Module,
-        lm_head: torch.nn.Module,
+        actor_embed_tokens: torch.nn.Module,
+        actor_lm_head: torch.nn.Module,
+        actor_norm: Optional[torch.nn.Module] = None,
     ):
-        """Set shared frozen modules from the target (actor) model.
+        """Copy frozen weights from the actor model into the drafter.
 
-        These are reference-shared (zero copy). The drafter uses them
-        for embedding and final projection but does not update their gradients.
+        Must be called:
+        1. At init (after actor model is loaded)
+        2. After each update_actor() (actor weights change with RL training)
 
-        Args:
-            embed_tokens: Actor model's embedding layer (frozen)
-            lm_head: Actor model's output projection (frozen)
+        Modules synced (all frozen, requires_grad=False):
+        - embed_tokens → self.module.draft_model.embed_tokens
+        - target_lm_head_weight → self._target_lm_head_weight (separate, for target distribution)
+        - verifier_norm → self._verifier_norm (separate, for pre-norm correction)
+
+        Note: draft_model.lm_head is NOT synced — it is the draft model's
+        own trainable parameter (produces draft logits in the loss kernel).
+        actor_lm_head is only used for target_lm_head_weight.
         """
-        self._shared_embed_tokens = embed_tokens
-        self._shared_lm_head = lm_head
+        draft_model = self._get_draft_model()
 
-        # If the draft model has load_embedding / set methods, use them
-        if hasattr(self.module, "model") and hasattr(self.module.model, "embed_tokens"):
-            self.module.model.embed_tokens = embed_tokens
-        if hasattr(self.module, "lm_head"):
-            self.module.lm_head = lm_head
+        # embed_tokens (used by draft_model.embed_input_ids())
+        if hasattr(draft_model, "embed_tokens"):
+            draft_model.embed_tokens.weight.data.copy_(actor_embed_tokens.weight.data)
+            draft_model.embed_tokens.weight.requires_grad = False
 
-        # Freeze shared params
-        for param in embed_tokens.parameters():
-            param.requires_grad = False
-        for param in lm_head.parameters():
-            param.requires_grad = False
+        # target_lm_head_weight (used for target distribution in LazyTarget)
+        # This is the actor's lm_head, NOT the draft model's lm_head.
+        if self._target_lm_head_weight is None:
+            self._target_lm_head_weight = actor_lm_head.weight.data.clone()
+            self._target_lm_head_weight.requires_grad = False
+        else:
+            self._target_lm_head_weight.copy_(actor_lm_head.weight.data)
 
-        logger.info("Shared embed_tokens and lm_head from actor (frozen)")
+        # verifier_norm (RMSNorm applied to pre-norm last_hidden_states from vLLM)
+        if actor_norm is not None:
+            if self._verifier_norm is None:
+                self._verifier_norm = copy.deepcopy(actor_norm)
+                self._verifier_norm.requires_grad_(False)
+            else:
+                for p_dst, p_src in zip(self._verifier_norm.parameters(), actor_norm.parameters()):
+                    p_dst.data.copy_(p_src.data)
+
+        logger.info("Synced frozen modules from actor (embed_tokens, target_lm_head%s)",
+                     ", verifier_norm" if actor_norm is not None else "")
+
+    def _get_draft_model(self):
+        """Get the underlying draft model from Eagle3Model wrapper.
+
+        self.module is Eagle3Model which holds self.draft_model.
+        With FSDP, self.module may be wrapped, so check .module too.
+        """
+        model = self.module
+        # Unwrap FSDP if needed
+        if hasattr(model, "module"):
+            model = model.module
+        # Eagle3Model holds draft_model
+        if hasattr(model, "draft_model"):
+            return model.draft_model
+        return model
+
+    # ------------------------------------------------------------------
+    # Model inputs
+    # ------------------------------------------------------------------
 
     def prepare_model_inputs(self, micro_batch: TensorDict):
-        """Prepare inputs for the EAGLE draft model forward pass.
+        """Prepare inputs for Eagle3Model.forward().
 
-        Expects:
-            micro_batch["input_ids"]: Token IDs [batch, seq]
-            micro_batch["hidden_states"]: Hidden states from target model [batch, seq, hidden_dim]
-            micro_batch["attention_mask"]: Attention mask [batch, seq] (optional)
+        Handles verifier_norm and target construction before calling
+        the 7-step TTT loop.
 
-        The hidden states come from Mooncake (fetched by the drafter worker
-        before calling train_batch).
+        Expects micro_batch to contain:
+            input_ids:          [B, T]       — token IDs
+            hidden_states:      [B, T, 3*D]  — 3 aux layer HS from Mooncake
+            last_hidden_states: [B, T, D]    — final layer HS from Mooncake (pre-norm)
+            attention_mask:     [B, T]       — 1=real, 0=pad
+            loss_mask:          [B, T]       — which tokens contribute to loss
+
+        Returns dict matching Eagle3Model.forward() signature:
+            input_ids, attention_mask, target (LazyTarget), loss_mask, hidden_states
         """
-        input_ids = micro_batch.get("input_ids", None)
-        hidden_states = micro_batch.get("hidden_states", None)
-        attention_mask = micro_batch.get("attention_mask", None)
+        from verl.models.eagle3.eagle3_model import compute_lazy_target_padded
 
-        model_inputs = {
+        input_ids = micro_batch["input_ids"]
+        hidden_states = micro_batch["hidden_states"]
+        attention_mask = micro_batch["attention_mask"]
+        loss_mask = micro_batch["loss_mask"]
+        last_hidden_states = micro_batch["last_hidden_states"]
+
+        # Apply verifier_norm to pre-norm last_hidden_states from vLLM
+        if self._verifier_norm is not None:
+            with torch.no_grad():
+                last_hidden_states = self._verifier_norm(last_hidden_states)
+
+        # Build target for Forward KL loss
+        eagle3 = self.module.module if hasattr(self.module, "module") else self.module
+        target = compute_lazy_target_padded(
+            last_hidden_states,
+            self._target_lm_head_weight,
+            eagle3.length,  # TTT length (7)
+        )
+
+        return {
             "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "target": target,
+            "loss_mask": loss_mask,
             "hidden_states": hidden_states,
         }
-        if attention_mask is not None:
-            model_inputs["attention_mask"] = attention_mask
-
-        return model_inputs

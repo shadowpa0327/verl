@@ -30,15 +30,19 @@ from verl.models.eagle3.ops.loss import (
     compiled_forward_kl_loss,
     compiled_forward_kl_loss_from_hs,
 )
-# padding utility — inline or import from verl
-def padding(tensor, target_len, pad_value=0, dim=-1):
-    """Pad tensor along dim to target_len."""
-    pad_size = target_len - tensor.size(dim)
-    if pad_size <= 0:
-        return tensor
-    pad_shape = list(tensor.shape)
-    pad_shape[dim] = pad_size
-    return torch.cat([tensor, torch.full(pad_shape, pad_value, dtype=tensor.dtype, device=tensor.device)], dim=dim)
+def padding(tensor, left=True):
+    """Shift tensor by one position along dim=1 with zero padding.
+
+    Mirrors TorchSpec's torchspec.utils.tensor.padding:
+    - left=True:  shift right (prepend zero, drop last)
+    - left=False: shift left  (drop first, append zero)
+    """
+    zeropadding = torch.zeros_like(tensor[:, -1:])
+    if left:
+        tensor = torch.cat((zeropadding, tensor[:, :-1]), dim=1)
+    else:
+        tensor = torch.cat((tensor[:, 1:], zeropadding), dim=1)
+    return tensor
 
 
 @dataclass
