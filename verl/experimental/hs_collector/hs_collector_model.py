@@ -94,7 +94,7 @@ class HSCollectorManager:
                 replica_rank=replica_rank,
                 config=inference_cfg,
                 model_config=model_config,
-                gpus_per_node=cfg.n_gpus_per_node if not self.resource_pool else 8,
+                gpus_per_node=cfg.n_gpus_per_node,
                 is_teacher_model=True,  # reuse teacher colocate plumbing in RolloutReplica
             )
             for replica_rank in range(num_replicas)

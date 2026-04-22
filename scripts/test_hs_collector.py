@@ -2,24 +2,23 @@
 """
 Standalone test for HSCollectorManager.
 
-Launches HSCollectorManager in standalone mode (no trainer, its own GPUs),
-tokenizes prompts, pushes them through the manager's async server path,
-extracts kv_transfer_params from the responses, and reads the hidden states
-back from Mooncake via a separate reader store.
+Mimics how RayPPOTrainer.init_workers launches the teacher via
+`ResourcePoolManager` + colocated `TeacherModelManager`: constructs a
+RayResourcePool, passes it to HSCollectorManager, and exercises the full
+batch API `compute_hidden_states(DataProto)` end-to-end.
 
-Proves end-to-end:
-  TokenOutput.extra_fields["kv_transfer_params"] → Mooncake.get → hidden_states
+Proves:
+  actor pool → HSCollectorManager (colocated) → vLLM prefill
+  → kv_transfer_params in extra_fields → Mooncake.get → hidden_states
 
-Requires: 1 GPU, mooncake_master binary, a HuggingFace model.
+Requires: N GPUs, mooncake_master binary, a HuggingFace model.
 
 Usage:
     python scripts/test_hs_collector.py
-    python scripts/test_hs_collector.py --model Qwen/Qwen2.5-0.5B-Instruct --gpu 0
-    python scripts/test_hs_collector.py --skip-master   # if master already running
+    python scripts/test_hs_collector.py --model Qwen/Qwen2.5-0.5B-Instruct --num-gpus 1
 """
 
 import argparse
-import asyncio
 import atexit
 import logging
 import os
@@ -28,11 +27,12 @@ import signal
 import subprocess
 import sys
 import time
-from uuid import uuid4
 
+import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -119,14 +119,14 @@ def make_mooncake_config(host, master_port, metadata_port, max_seq_len, hidden_d
     )
 
 
-def build_hs_collector_config(model_path, aux_layer_ids, max_seq_len, gpu_mem, n_gpus):
-    """Minimal HSCollectorConfig-shaped DictConfig (standalone mode)."""
+def build_hs_collector_config(model_path, aux_layer_ids, max_seq_len, gpu_mem, n_gpus_per_node, nnodes):
+    """HSCollectorConfig-shaped DictConfig matching ray_trainer.py's teacher section."""
     return OmegaConf.create(
         {
             "enabled": True,
             "model_path": model_path,
-            "n_gpus_per_node": n_gpus,
-            "nnodes": 1,
+            "n_gpus_per_node": n_gpus_per_node,
+            "nnodes": nnodes,
             "inference": {
                 "name": "vllm",
                 "tensor_model_parallel_size": 1,
@@ -162,6 +162,42 @@ def build_hs_collector_config(model_path, aux_layer_ids, max_seq_len, gpu_mem, n
     )
 
 
+def build_data_proto(tokenized, pad_token_id, prompt_width):
+    """Build a DataProto shaped like the post-rollout batch that ray_trainer.py
+    passes into _compute_teacher_colocate.
+
+    Each sample = left-padded prompt + right-padded 1-token response (pad_token)
+    with attention_mask=1 only on the valid prompt tokens. The manager's
+    _unpad_sequence_ids extracts just the valid prompt for prefill.
+    """
+    from verl.protocol import DataProto
+
+    n = len(tokenized)
+    response_width = 1
+    total = prompt_width + response_width
+
+    prompts = torch.full((n, prompt_width), pad_token_id, dtype=torch.long)
+    responses = torch.full((n, response_width), pad_token_id, dtype=torch.long)
+    attention_mask = torch.zeros((n, total), dtype=torch.long)
+
+    for i, ids in enumerate(tokenized):
+        plen = min(len(ids), prompt_width)
+        prompts[i, -plen:] = torch.tensor(ids[-plen:], dtype=torch.long)
+        attention_mask[i, prompt_width - plen : prompt_width] = 1
+
+    input_ids = torch.cat([prompts, responses], dim=1)
+    batch = TensorDict(
+        {
+            "prompts": prompts,
+            "responses": responses,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        },
+        batch_size=[n],
+    )
+    return DataProto(batch=batch)
+
+
 # ─── Prompts ──────────────────────────────────────────────────────────
 
 SAMPLE_PROMPTS = [
@@ -183,11 +219,13 @@ def run_test(args):
     from transformers import AutoTokenizer
 
     from verl.experimental.hs_collector import HSCollectorManager
+    from verl.single_controller.ray.base import RayResourcePool
     from verl.utils.mooncake.eagle_store import EagleMooncakeStore
 
     aux_layers, hidden_size = get_aux_layer_ids(args.model)
     print(f"\n  Model={args.model} hidden={hidden_size} aux_layers={aux_layers}")
 
+    # Mooncake reader (consumer side)
     mc_config = make_mooncake_config(
         host=args.master_host,
         master_port=args.master_port,
@@ -197,58 +235,56 @@ def run_test(args):
         lease_ttl=args.lease_ttl,
     )
     mc_config.export_env()
-
-    # Reader store (consumer side)
     reader_store = EagleMooncakeStore(mc_config)
     reader_store.setup()
+
+    # Resource pool — same shape as RayPPOTrainer's actor pool
+    print(f"\n[Phase 1] Creating RayResourcePool ({args.num_gpus} GPUs, 1 node)")
+    resource_pool = RayResourcePool(
+        process_on_nodes=[args.num_gpus],
+        use_gpu=True,
+        max_colocate_count=3,
+        name_prefix="hs_collector_test",
+    )
 
     hs_config = build_hs_collector_config(
         model_path=args.model,
         aux_layer_ids=aux_layers,
         max_seq_len=args.max_seq_len,
         gpu_mem=args.gpu_mem,
-        n_gpus=1,
+        n_gpus_per_node=args.num_gpus,
+        nnodes=1,
     )
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-
-    print("\n[Phase 1] Launching HSCollectorManager (standalone)...")
+    print("\n[Phase 2] Launching HSCollectorManager (colocated mode)...")
     t0 = time.time()
-    manager = HSCollectorManager(config=hs_config, resource_pool=None)
+    manager = HSCollectorManager(config=hs_config, resource_pool=resource_pool)
     print(f"  Ready in {time.time() - t0:.1f}s ({len(manager.rollout_replicas)} replicas)")
 
-    print("\n[Phase 2] Tokenizing prompts...")
+    print("\n[Phase 3] Tokenizing prompts + building DataProto...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     prompts = [SAMPLE_PROMPTS[i % len(SAMPLE_PROMPTS)] for i in range(args.num_prompts)]
     tokenized = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
-    for i, ids in enumerate(tokenized[:3]):
-        print(f"  [{i}] {len(ids):4d} tokens  \"{prompts[i][:60]}...\"")
+    max_prompt_len = max(len(ids) for ids in tokenized)
+    prompt_width = max(max_prompt_len, 16)
+    data = build_data_proto(tokenized, tokenizer.pad_token_id or 0, prompt_width=prompt_width)
+    print(f"  {len(tokenized)} prompts, prompt_width={prompt_width}")
 
-    print("\n[Phase 3] Calling server_manager.compute_hidden_states_single directly...")
-    # Bypass the DataProto-shaped batch API; call single-sample directly
-    # so we don't have to construct a full prompts/responses split.
-    manager.wake_up()
-    try:
+    print("\n[Phase 4] manager.compute_hidden_states(data) ...")
+    t0 = time.time()
+    hs_batch = manager.compute_hidden_states(data)
+    gen_sec = time.time() - t0
+    nt = hs_batch.non_tensor_batch
+    print(f"  Collected {len(nt['hs_mooncake_keys'])} samples in {gen_sec:.2f}s")
 
-        async def collect_all():
-            return await asyncio.gather(
-                *[manager.server_manager.compute_hidden_states_single(ids) for ids in tokenized]
-            )
-
-        t0 = time.time()
-        results = asyncio.run(collect_all())
-        gen_sec = time.time() - t0
-    finally:
-        manager.sleep()
-    print(f"  Collected {len(results)} samples in {gen_sec:.2f}s")
-
-    print("\n[Phase 4] Mooncake fetch + verify...")
+    print("\n[Phase 5] Mooncake fetch + verify...")
     all_ok = True
-    for i, (tokens, r) in enumerate(zip(tokenized, results, strict=True)):
-        key = r["mooncake_key"]
-        shapes = r["shapes"]
+    keys, shapes_arr, dtypes_arr = nt["hs_mooncake_keys"], nt["hs_shapes"], nt["hs_dtypes"]
+    for i, tokens in enumerate(tokenized):
+        key = str(keys[i])
+        shapes = shapes_arr[i]
         dtypes = {
-            k: getattr(torch, v) if isinstance(v, str) and hasattr(torch, v) else v for k, v in r["dtypes"].items()
+            k: getattr(torch, v) if isinstance(v, str) and hasattr(torch, v) else v for k, v in dtypes_arr[i].items()
         }
         if not key:
             print(f"  [{i}] FAIL: empty mooncake_key (connector didn't fire)")
@@ -260,7 +296,7 @@ def run_test(args):
         status = "OK" if (hs_ok and ids_ok) else "FAIL"
         if not (hs_ok and ids_ok):
             all_ok = False
-        if i < 3 or i == len(results) - 1 or not (hs_ok and ids_ok):
+        if i < 3 or i == len(tokenized) - 1 or not (hs_ok and ids_ok):
             print(f"  [{i}] key={key} hs={list(got.hidden_states.shape)} ids_match={ids_ok} {status}")
         reader_store.remove_eagle3_tensors(key, has_last_hidden_states=got.last_hidden_states is not None)
 
@@ -273,7 +309,7 @@ def run_test(args):
 def main():
     parser = argparse.ArgumentParser(description="Standalone HSCollectorManager test")
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct")
-    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--num-gpus", type=int, default=1, help="GPUs in the resource pool")
     parser.add_argument("--gpu-mem", type=float, default=0.5)
     parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--num-prompts", type=int, default=8)
@@ -285,8 +321,8 @@ def main():
     args = parser.parse_args()
 
     print(f"{'=' * 70}")
-    print(f"  HSCollectorManager standalone test")
-    print(f"  model={args.model} gpu={args.gpu} prompts={args.num_prompts}")
+    print(f"  HSCollectorManager standalone test (colocated)")
+    print(f"  model={args.model} gpus={args.num_gpus} prompts={args.num_prompts}")
     print(f"{'=' * 70}")
 
     master_proc = None
