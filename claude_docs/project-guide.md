@@ -74,10 +74,7 @@ RayDrafterCTPPOTrainer (driver)
 # Mooncake store put/get/remove cycle (needs mooncake_master)
 python scripts/test_mooncake_store.py
 
-# Mooncake round-trip with configurable shapes (needs mooncake_master)
-python scripts/test_vllm_hs_collector.py --seq-len 256 --hidden-dim 3584 --num-samples 5
-
-# Single-controller simulation of drafter pipeline
+# Single-controller simulation of drafter pipeline (CPU-only smoke test)
 python scripts/test_single_controller_hs.py
 
 # Standalone HSCollectorManager end-to-end: vLLM → Mooncake → reader (needs GPU + mooncake_master)

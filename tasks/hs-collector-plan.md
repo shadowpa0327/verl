@@ -96,7 +96,7 @@ self.hs_collector_manager.update_weights(actor_params)
 - `scripts/test_real_hs_collector.py`
 - `scripts/test_hs_collector_verl.py`
 
-Keep `scripts/test_mooncake_store.py` and `scripts/test_vllm_hs_collector.py`.
+Keep `scripts/test_mooncake_store.py`.
 
 ## Doc updates
 
