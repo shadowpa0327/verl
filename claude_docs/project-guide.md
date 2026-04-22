@@ -26,17 +26,18 @@ RL Step with Drafter Co-Training:
 ### Architecture
 
 ```
-RayPPOTrainer (driver)
-├── DrafterDataController              ← owns raw_prompts + sample_pool
+RayDrafterCTPPOTrainer (driver)
+├── DrafterDataController              ← owns sample_pool
 │     drain_as_dataproto() → mesh dispatch per DP rank
+├── HSCollectorManager                 ← colocated vLLM replicas + KV connector
+│     compute_hidden_states(batch) — wake → prefill → Mooncake → sleep
 │
 └── actor_rollout_wg
     └── ActorRolloutRefDrafterWorker
-            ├── actor        (TrainingWorker → FSDPEngine)       [inherited]
-            ├── ref          (TrainingWorker → FSDPEngine)       [inherited]
-            ├── rollout      (BaseRollout → vLLM)                [inherited]
-            ├── hs_collector (VllmHSCollector → vLLM + KV connector) [NEW]
-            └── drafter      (TrainingWorker → FSDPDrafterEngine)    [NEW]
+            ├── actor     (TrainingWorker → FSDPEngine)       [inherited]
+            ├── ref       (TrainingWorker → FSDPEngine)       [inherited]
+            ├── rollout   (BaseRollout → vLLM)                [inherited]
+            └── drafter   (TrainingWorker → FSDPDrafterEngine) [NEW]
 ```
 
 ### Key Design Decisions
@@ -47,36 +48,17 @@ RayPPOTrainer (driver)
 - **No unanimity gate** — the centralized controller + mesh dispatch guarantees all ranks get data or none do. Consensus by construction.
 - **Pre-norm handling** — vLLM captures `last_hidden_states` before the final RMSNorm (pre-norm). `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` (a frozen copy of the actor's `model.norm`) to normalize before target distribution computation. Note: the loss kernel's built-in RMSNorm is for the *draft* model's norm, not the verifier — these are separate.
 
-### TorchSpec Reference (Source Knowledge)
-
-The verl drafter pipeline is ported from TorchSpec. Reference material:
-
-| Location | What |
-|---|---|
-| `reference/TorchSpec/` | Full TorchSpec source code |
-| `reference/torch_spec_docs/Eagle3-Co-Trained/` | 9 design docs covering architecture, data flow, code maps |
-
-**Key TorchSpec internals to understand:**
-- **Eagle3 architecture**: 4 trainable components: `fc` (3*D→D) + `midlayer` (1 decoder layer) + `norm` (RMSNorm) + `lm_head` (D→V). ~140M params for 7B target. Only `embed_tokens` is frozen (from target, `requires_grad=False` at `base.py:191`). `lm_head` is the draft model's own trainable projection — NOT frozen, NOT shared from target. See `torchspec/models/draft/llama3_eagle.py:1737-1797`.
-- **7-step TTT loop**: Each step predicts `i` positions ahead, KV cache accumulates, losses weighted 0.8^i. See `torchspec/models/eagle3.py:192-239`.
-- **Forward KL loss**: NOT cross-entropy. Fused `torch.compile`: RMSNorm → lm_head → `-(target_p * log_softmax(logits)).sum(-1).mean()`. Two variants for vocab pruning vs lazy target. See `torchspec/models/ops/loss.py`.
-- **Controller**: 4 FIFO stores (`_stored_dataset` → `prompt_buffer` → `sample_pool` → `train_queues[]`). Only routes metadata; tensors in Mooncake. See `torchspec/controller/training_controller.py`.
-- **KV Connector**: Scheduler-side (pre-compute metadata) and Worker-side (KV cache extract → Mooncake) — **they do NOT share state**. See `torchspec/inference/engine/mooncake_hidden_states_connector.py`.
-- **Module sharing**: Only `embed_tokens` is frozen from target (for draft input). `target_lm_head` + `verifier_norm` loaded separately from target (for computing target distribution). `fc` + `midlayer` + `norm` + `lm_head` are all trainable, part of the draft model. The draft's `lm_head` is distinct from `target_lm_head`.
-- **verifier_norm**: vLLM captures pre-norm last_hs. In verl, `FSDPDrafterEngine._verifier_norm` (frozen copy of actor's `model.norm`) is applied in `prepare_model_inputs()` before target construction. TorchSpec equivalent: `eagle3_trainer.py:239-241`.
-- **target_lm_head_weight**: Stored as `FSDPDrafterEngine._target_lm_head_weight` (frozen clone of actor's `lm_head.weight`). Used in `prepare_model_inputs()` → `compute_lazy_target_padded()` to build `LazyTarget`. Distinct from the draft model's `lm_head` which is used for draft logits in the loss kernel.
-
 ### Migration Files (branch `feat/drafter-cotraining`)
 
 | Directory | What | Lines |
 |---|---|---|
-| `verl/utils/mooncake/` | Mooncake KV store (config, put/get/remove, buffers, KV connector) | ~2,600 |
-| `verl/models/eagle3/` | Eagle3 model (draft arch, Forward KL loss, TTT loop) | ~2,700 |
-| `verl/trainer/drafter/` | DrafterDataController + orchestration sketch | ~260 |
-| `verl/workers/drafter_workers.py` | ActorRolloutRefDrafterWorker | ~230 |
-| `verl/workers/engine/fsdp/drafter_impl.py` | FSDPDrafterEngine ("drafter_model") | ~130 |
-| `verl/workers/rollout/vllm_rollout/vllm_hs_collector.py` | vLLM HS collector (prefill + KV connector) | ~475 |
-| `scripts/test_*.py` | Test scripts (Mooncake store, vLLM HS pipeline) | ~570 |
+| `verl/utils/mooncake/` | Mooncake KV store (config, put/get/remove, buffers, KV connector) | ~2,580 |
+| `verl/models/eagle3/` | Eagle3 model (draft arch, Forward KL loss, TTT loop) | ~2,690 |
+| `verl/trainer/drafter/` | DrafterDataController, orchestration, CT trainer, entry point | ~963 |
+| `verl/workers/drafter_workers.py` | ActorRolloutRefDrafterWorker | ~266 |
+| `verl/workers/engine/fsdp/drafter_impl.py` | FSDPDrafterEngine ("drafter_model") | ~217 |
+| `verl/experimental/hs_collector/` | `HSCollectorManager` + `AsyncHSCollectorServerManager` (clone of teacher colocate) | ~200 |
+| `scripts/test_*.py` | Test scripts (5 files: Mooncake, HS collector, controller, e2e) | ~2,145 |
 
 ### Key Documents
 
@@ -85,20 +67,21 @@ The verl drafter pipeline is ported from TorchSpec. Reference material:
 | `claude_docs/migration-status.md` | **Current state** | What's done, what's TODO (ordered), frozen module sync, verification checklist |
 | `claude_docs/rfc-drafter-trainer-integration.md` | **Design (locked)** | Why: 3-level pipeline, DrafterDataController, sleep/wake, dispatch mechanism |
 | `claude_docs/torchspec-to-verl-migration-map.md` | **Reference** | TorchSpec internals + file-by-file connection map to verl |
-| `reference/torch_spec_docs/Eagle3-Co-Trained/` | **Source docs** | 9 TorchSpec design docs (Eagle3 training, controller, data flow, code maps) |
-| `reference/TorchSpec/torchspec/` | **Source code** | Full TorchSpec source — the upstream reference implementation |
 
 ### Testing
 
 ```bash
-# Stage 1: Import check (no GPU needed)
-python scripts/test_vllm_hs_collector.py --stage 1
+# Mooncake store put/get/remove cycle (needs mooncake_master)
+python scripts/test_mooncake_store.py
 
-# Stage 2: Mooncake store (needs mooncake_master)
-python scripts/test_vllm_hs_collector.py --stage 2
+# Mooncake round-trip with configurable shapes (needs mooncake_master)
+python scripts/test_vllm_hs_collector.py --seq-len 256 --hidden-dim 3584 --num-samples 5
 
-# Stage 3: Full pipeline (needs GPU + mooncake_master)
-python scripts/test_vllm_hs_collector.py --stage 3 --model-path Qwen/Qwen2.5-0.5B-Instruct
+# Single-controller simulation of drafter pipeline
+python scripts/test_single_controller_hs.py
+
+# Standalone HSCollectorManager end-to-end: vLLM → Mooncake → reader (needs GPU + mooncake_master)
+python scripts/test_hs_collector.py --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
 ---
@@ -218,12 +201,12 @@ See **[`claude_docs/workflow-orchestration.md`](./claude_docs/workflow-orchestra
 
 1. **Plan mode** for any non-trivial task (3+ steps). Re-plan if things go sideways.
 2. **Subagents** liberally — offload research, exploration, parallel analysis. One task per subagent.
-3. **Self-improvement** — after any user correction, capture the lesson in `tasks/lessons.md`.
+3. **Self-improvement** — after any user correction, capture the lesson.
 4. **Verify before done** — never mark complete without proving it works (tests, logs, diffs).
 5. **Demand elegance** — pause on non-trivial changes to ask "is there a more elegant way?" Skip for simple fixes.
 6. **Autonomous bug fixing** — given a bug report, just fix it. Zero hand-holding.
 
-Task tracking: plan to `tasks/todo.md`, mark progress, document results, capture lessons.
+Task tracking: use Claude Code tasks to plan, mark progress, and track results.
 
 Core principles: **Simplicity First** | **No Laziness** (root causes only) | **Minimal Impact**
 

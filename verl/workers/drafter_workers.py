@@ -2,15 +2,15 @@
 ActorRolloutRefDrafterWorker — extends ActorRolloutRefWorker with EAGLE drafter co-training.
 
 Adds:
-- self.hs_collector: VllmHSCollector (vLLM with KV connector, colocated, sleep/wake)
 - self.drafter: TrainingWorker (FSDPDrafterEngine for EAGLE model training)
 
-The DrafterDataController lives on the driver (RayPPOTrainer), not here.
-This worker only:
+HS collection is owned by HSCollectorManager on the trainer driver
+(see verl/experimental/hs_collector/), not by this worker.
+
+The DrafterDataController also lives on the driver. This worker only:
 - Receives per-rank data via mesh dispatch (update_drafter)
 - Fetches tensors from Mooncake
 - Runs drafter training
-- Participates in HS collection when asked
 
 See claude_docs/rfc-drafter-trainer-integration.md for the full design.
 """
@@ -35,16 +35,14 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         self.actor           (TrainingWorker → FSDPEngine)       [inherited]
         self.ref             (TrainingWorker → FSDPEngine)       [inherited]
         self.rollout         (BaseRollout → vLLM)                [inherited]
-        self.hs_collector    (VllmHSCollector → vLLM with KV connector) [NEW]
         self.drafter         (TrainingWorker → FSDPDrafterEngine)       [NEW]
 
-    GPU time-multiplexing order per RL step:
-        rollout (AWAKE) → hs_collector (AWAKE) → drafter (AWAKE) → actor (AWAKE)
+    HS collection lives on the driver (HSCollectorManager), not in this worker.
+    Per-step order: rollout generates → HS collector (driver-owned) prefills → drafter trains → actor updates.
     """
 
     def __init__(self, config: DictConfig, role: str, **kwargs):
         super().__init__(config, role, **kwargs)
-        self.hs_collector = None
         self.drafter = None
         self._drafter_enabled = config.get("drafter", {}).get("enable", False)
 
@@ -56,13 +54,10 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         if not self._drafter_enabled:
             return
 
-        # 5. Build HS collector (colocated vLLM with KV connector)
-        self._init_hs_collector()
-
-        # 6. Build drafter training engine
+        # 5. Build drafter training engine
         self._init_drafter()
 
-        # 7. Register drafter mesh (pure DP — every rank is unique)
+        # 6. Register drafter mesh (pure DP — every rank is unique)
         import torch.distributed as dist
         self._register_dispatch_collect_info(
             mesh_name="drafter",
@@ -70,25 +65,7 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             is_collect=True,
         )
 
-        logger.info("Drafter co-training initialized (HS collector + drafter engine)")
-
-    def _init_hs_collector(self):
-        """Initialize the vLLM HS collector.
-
-        Same GPU as rollout, time-multiplexed via sleep/wake.
-        Uses vLLM with extract_hidden_states speculative config + KV connector.
-        """
-        from verl.workers.rollout.vllm_rollout.vllm_hs_collector import VllmHSCollector
-
-        hs_config = self.config.get("hs_collector", {})
-        mooncake_config = self.config.get("mooncake", None)
-
-        self.hs_collector = VllmHSCollector(
-            args=hs_config,
-            mooncake_config=mooncake_config,
-        )
-
-        logger.info("vLLM HS collector initialized")
+        logger.info("Drafter co-training initialized (drafter engine)")
 
     def _init_drafter(self):
         """Initialize the drafter training engine.
@@ -152,41 +129,6 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
             actor_norm=actor_norm,
         )
 
-    # ── HS Collection ─────────────────────────────────────────
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def collect_hidden_states(self, sequences: DataProto) -> DataProto:
-        """Run HS collection: rollout sleeps → HS collector wakes → prefill → Mooncake → metadata.
-
-        Called by driver after generate_sequences().
-        Returns DataProto with SampleMeta packed in non_tensor_batch.
-        """
-        if self.hs_collector is None:
-            return DataProto()
-
-        # TODO: Sleep/wake coordination
-        # self.rollout.release()  — rollout should already be sleeping after generate
-        # self.hs_collector.resume(["weights"])
-
-        sample_metas = self.hs_collector.collect_hidden_states(sequences)
-
-        # self.hs_collector.release()
-
-        # Pack SampleMeta list into DataProto for driver collection
-        import numpy as np
-        if not sample_metas:
-            return DataProto()
-
-        return DataProto(
-            non_tensor_batch={
-                'mooncake_keys': np.array([m.mooncake_key for m in sample_metas], dtype=object),
-                'shapes': np.array([m.shapes for m in sample_metas], dtype=object),
-                'dtypes': np.array([m.dtypes for m in sample_metas], dtype=object),
-                'seq_lens': np.array([m.seq_len for m in sample_metas], dtype=object),
-                'n_tokens': np.array([m.n_tokens for m in sample_metas], dtype=object),
-            },
-        )
-
     # ── Drafter Training ──────────────────────────────────────
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="drafter"))
@@ -238,13 +180,15 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self):
-        """Sync actor + drafter weights to rollout + HS collector.
+        """Sync actor + drafter weights to rollout.
 
         Extended from parent to also:
         1. Re-sync frozen modules (embed_tokens, lm_head) from actor → drafter
            (actor weights changed during update_actor())
-        2. Sync actor weights to HS collector (same weights as rollout)
-        3. Sync drafter weights to rollout (for speculative decoding)
+        2. Sync drafter weights to rollout (for speculative decoding)
+
+        Note: actor → HS collector sync is driven from the trainer via
+        HSCollectorManager.update_weights, not here.
         """
         # Actor → rollout (inherited)
         await super().update_weights()
@@ -252,11 +196,6 @@ class ActorRolloutRefDrafterWorker(ActorRolloutRefWorker):
         # Actor → drafter frozen modules (embed_tokens, lm_head changed after training)
         if self.drafter is not None:
             self._sync_drafter_frozen_modules()
-
-        if self.hs_collector is not None:
-            # Actor → HS collector (same weights, separate server)
-            per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param()
-            await self.hs_collector.update_weights(per_tensor_param, peft_config=peft_config)
 
         if self.drafter is not None and self.rollout is not None:
             # Drafter → rollout (for speculative decoding at inference time)

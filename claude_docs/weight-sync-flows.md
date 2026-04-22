@@ -15,7 +15,7 @@ module copies in the drafter must be re-synced after each `update_actor()`.
 |---|---|---|---|
 | **Actor** | FSDPEngine | Full target model (all layers) | GPU (training) |
 | **Rollout** | vLLM | Mirror of actor (for generation) | GPU (inference) |
-| **HS Collector** | vLLM + KV connector | Mirror of actor (for prefill → HS extraction) | GPU (inference), time-multiplexed with rollout |
+| **HS Collector** | `HSCollectorManager` → vLLM replicas + KV connector | Mirror of actor (for prefill → HS extraction) | GPU, colocated with actor/rollout, time-multiplexed via sleep/wake |
 | **Drafter Trainer** | FSDPDrafterEngine → Eagle3Model | Trainable: `fc`, `midlayer`, `norm`, `lm_head`. Frozen copies: `embed_tokens`, `verifier_norm`, `target_lm_head_weight` | GPU (training), time-multiplexed |
 
 ---
@@ -52,10 +52,10 @@ module copies in the drafter must be re-synced after each `update_actor()`.
 ### Flow 2: Actor → HS Collector (full weights)
 
 - **What:** All actor parameters (HS collector runs the same model for prefill)
-- **When:** `update_weights()` at end of each RL step
-- **How:** `self.actor.engine.get_per_tensor_param()` → `self.hs_collector.update_weights()`
-- **Status:** Wired (code exists, not yet tested end-to-end)
-- **File:** `verl/workers/drafter_workers.py:256-259`
+- **When:** After `update_actor()` at end of each RL step
+- **How:** `RayDrafterCTPPOTrainer` calls `self.hs_collector_manager.update_weights(actor_params)`; manager fans out to its `RolloutReplica` instances
+- **Status:** Stub (TODO — wire to verl's checkpoint_engine, same mechanism as actor → rollout)
+- **Files:** `verl/experimental/hs_collector/hs_collector_model.py` (`HSCollectorManager.update_weights`), `verl/trainer/drafter/drafter_ct_ray_trainer.py` (call site in `update_weights()` block)
 
 ### Flow 3: Actor → Drafter Trainer (frozen modules only)
 
@@ -86,19 +86,19 @@ module copies in the drafter must be re-synced after each `update_actor()`.
 ## Sync Timing in RL Step
 
 ```
-generate_sequences()          ← rollout uses actor weights (Flow 1, prev step)
+generate_sequences()               ← rollout uses actor weights (Flow 1, prev step)
   ↓
-collect_hidden_states()       ← HS collector uses actor weights (Flow 2, prev step)
+hs_collector_manager.compute_hidden_states()   ← HS collector wakes, uses actor weights (Flow 2, prev step), sleeps
   ↓
-update_drafter()              ← drafter uses frozen copies (Flow 3, prev step)
+update_drafter()                   ← drafter uses frozen copies (Flow 3, prev step)
   ↓
-update_actor()                ← actor weights change here
+update_actor()                     ← actor weights change here
   ↓
-update_weights()              ← Flows 1-4 all fire here
-  ├─ Flow 1: actor → rollout         (inherited)
-  ├─ Flow 2: actor → HS collector    (wired)
-  ├─ Flow 3: actor → drafter frozen  (wired)
-  └─ Flow 4: drafter → rollout       (TODO)
+update_weights()                   ← Flows 1-4 all fire here
+  ├─ Flow 1: actor → rollout          (inherited, via checkpoint_manager)
+  ├─ Flow 2: actor → HS collector     (TODO stub — via hs_collector_manager.update_weights)
+  ├─ Flow 3: actor → drafter frozen   (wired, inside worker update_weights)
+  └─ Flow 4: drafter → rollout        (TODO)
 ```
 
 **Important:** Flows 1-3 ensure that rollout, HS collector, and drafter

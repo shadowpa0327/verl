@@ -86,10 +86,11 @@ TorchSpec (async):
   → MooncakeDataFetcher → DataLoader → Eagle3Trainer._forward()
 
 verl (sync, per RL step):
-  generate_sequences() → DrafterDataController.push_raw_prompts()
-  → pull_raw_prompts() → collect_hidden_states() [VllmHSCollector]
-  → Mooncake.put() → DrafterDataController.push_samples()
-  → drain_as_dataproto() → mesh dispatch → update_drafter()
+  generate_sequences()
+  → HSCollectorManager.compute_hidden_states(batch)  [colocated replicas wake/sleep]
+  → Mooncake.put() via KV connector
+  → DrafterDataController.push_samples() (from hs metadata)
+  → drain_as_dataproto() → drafter mesh dispatch → update_drafter()
   → Mooncake.get() → Eagle3Model.forward() → Mooncake.remove()
 ```
 
@@ -111,7 +112,7 @@ verl (sync, per RL step):
 
 | TorchSpec File | verl File | What Changed |
 |---|---|---|
-| `inference/engine/vllm_engine.py` (`VllmEngine`) | `verl/workers/rollout/vllm_rollout/vllm_hs_collector.py` (`VllmHSCollector`) | Nearly identical. `kv_connector_module_path` → `verl.utils.mooncake.hidden_states_connector`. Removed `RayActor` base, `InferenceEngine` base, `setup_file_logging`. |
+| `inference/engine/vllm_engine.py` (`VllmEngine`) | `verl/experimental/hs_collector/` (`HSCollectorManager` + `AsyncHSCollectorServerManager`) | Clone of verl's colocated `TeacherModelManager`. Spawns `RolloutReplica` instances with `kv_transfer_config=MooncakeHiddenStatesConnector` + `speculative_config=extract_hidden_states`. Called sync post-rollout. |
 | `inference/engine/mooncake_hidden_states_connector.py` | `verl/utils/mooncake/hidden_states_connector.py` | Copy with import paths: `torchspec.config` → `verl.utils.mooncake.config`, `torchspec.transfer` → `verl.utils.mooncake`. |
 | Standalone Ray actor, engine pool | Colocated on same GPU, time-multiplexed via sleep/wake | Major architectural change. |
 
@@ -152,7 +153,7 @@ verl (sync, per RL step):
 
 | verl File | Purpose | TorchSpec Equivalent |
 |---|---|---|
-| `verl/workers/drafter_workers.py` | `ActorRolloutRefDrafterWorker`: single worker owns actor, ref, rollout, hs_collector, drafter | TorchSpec uses separate Ray actors for each role |
+| `verl/workers/drafter_workers.py` | `ActorRolloutRefDrafterWorker`: owns actor, ref, rollout, drafter. HS collector lives on driver as `HSCollectorManager`. | TorchSpec uses separate Ray actors for each role |
 | `verl/workers/engine/fsdp/drafter_impl.py` | `FSDPDrafterEngine`: wraps `Eagle3Model` with FSDP, copies frozen modules from actor, handles target construction in `prepare_model_inputs()` | Split across `eagle3_trainer.py` init + `fsdp.py` setup |
 
 ---

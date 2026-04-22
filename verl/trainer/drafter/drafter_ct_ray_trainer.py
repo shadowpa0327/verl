@@ -60,50 +60,22 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 
-from verl.trainer.drafter.controller import DrafterDataController, SequenceMeta, SampleMeta
+from verl.trainer.drafter.controller import DrafterDataController, SampleMeta
 
 
-def _gen_batch_to_sequence_metas(gen_batch_output: DataProto) -> list[SequenceMeta]:
-    """Convert rollout DataProto → List[SequenceMeta] for controller Level 1.
-
-    Extracts per-sequence input_ids and attention_mask from the batch tensors.
-    prompt_len is derived from the original prompt portion (before generation).
-    """
-    input_ids = gen_batch_output.batch["input_ids"]  # (B, seq_len)
-    attention_mask = gen_batch_output.batch["attention_mask"]  # (B, seq_len)
-    batch_size = input_ids.shape[0]
-
-    metas = []
-    for i in range(batch_size):
-        mask = attention_mask[i]
-        seq_len = int(mask.sum().item())
-        metas.append(SequenceMeta(
-            input_ids=input_ids[i],
-            attention_mask=mask,
-            prompt_len=seq_len,  # full sequence length for prefill-only
-            response_len=0,
-        ))
-    return metas
-
-
-def _sample_metas_from_dataproto(hs_output: DataProto) -> list[SampleMeta]:
-    """Convert worker HS collection output → List[SampleMeta] for controller Level 2."""
-    if not hs_output.non_tensor_batch or 'mooncake_keys' not in hs_output.non_tensor_batch:
+def _sample_metas_from_hs_batch(hs_batch: DataProto) -> list[SampleMeta]:
+    """Convert HSCollectorManager.compute_hidden_states output → List[SampleMeta]."""
+    nt = hs_batch.non_tensor_batch
+    if not nt or "hs_mooncake_keys" not in nt:
         return []
-
-    keys = hs_output.non_tensor_batch['mooncake_keys']
-    shapes = hs_output.non_tensor_batch.get('shapes', [{}] * len(keys))
-    dtypes = hs_output.non_tensor_batch.get('dtypes', [{}] * len(keys))
-    seq_lens = hs_output.non_tensor_batch.get('seq_lens', [0] * len(keys))
-    n_tokens = hs_output.non_tensor_batch.get('n_tokens', [0] * len(keys))
-
+    keys = nt["hs_mooncake_keys"]
     return [
         SampleMeta(
             mooncake_key=str(keys[i]),
-            shapes=shapes[i] if isinstance(shapes[i], dict) else {},
-            dtypes=dtypes[i] if isinstance(dtypes[i], dict) else {},
-            seq_len=int(seq_lens[i]),
-            n_tokens=int(n_tokens[i]),
+            shapes=nt["hs_shapes"][i] if isinstance(nt["hs_shapes"][i], dict) else {},
+            dtypes=nt["hs_dtypes"][i] if isinstance(nt["hs_dtypes"][i], dict) else {},
+            seq_len=int(nt["hs_seq_lens"][i]),
+            n_tokens=int(nt["hs_seq_lens"][i]),
         )
         for i in range(len(keys))
     ]
@@ -129,47 +101,46 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
         # Initialize drafter data controller on driver
         dp_size = config.trainer.n_gpus_per_node * config.trainer.nnodes
         self._drafter_ctrl = DrafterDataController(dp_size=dp_size)
+        self.use_hs_collector = bool(config.get("hs_collector", {}).get("enabled", False))
+        self.hs_collector_manager = None
 
-    def _run_drafter_sub_pipeline(self, gen_batch_output: DataProto, timing_raw: dict, metrics: dict):
-        """Run the drafter co-training sub-pipeline.
+    def init_workers(self):
+        """Extend RayPPOTrainer.init_workers with HSCollectorManager (colocated)."""
+        super().init_workers()
+        if self.use_hs_collector:
+            from verl.experimental.hs_collector import HSCollectorManager
+            from verl.trainer.ppo.ray_trainer import Role
 
-        Phases:
-          1. Push rollout output → controller Level 1 (raw_prompts)
-          2. HS collection: pull → vLLM prefill → Mooncake → push to Level 2
-          3. Drain Level 2 → mesh dispatch → drafter training
-        """
-        with marked_timer("drafter", timing_raw, color="cyan"):
-            # Phase 1: Rollout → raw_prompts (driver Level 1)
-            seq_metas = _gen_batch_to_sequence_metas(gen_batch_output)
-            self._drafter_ctrl.push_raw_prompts(seq_metas)
-
-            # Phase 2: HS collection (vLLM prefill → Mooncake)
-            raw = self._drafter_ctrl.pull_raw_prompts()
-
-            # Build a DataProto from the raw prompts for worker RPC.
-            # collect_hidden_states uses ONE_TO_ALL dispatch, so we send
-            # the full batch; each worker processes its local shard internally.
-            from tensordict import TensorDict
-
-            input_ids = torch.stack([m.input_ids for m in raw])
-            attention_mask = torch.stack([m.attention_mask for m in raw])
-            hs_input = DataProto(
-                batch=TensorDict({
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                }, batch_size=[input_ids.shape[0]]),
+            actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+            actor_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            self.hs_collector_manager = HSCollectorManager(
+                config=self.config.hs_collector,
+                resource_pool=actor_pool,
             )
-            hs_output = self.actor_rollout_wg.collect_hidden_states(hs_input)
 
-            # Convert worker output back to SampleMeta for controller Level 2
-            sample_metas = _sample_metas_from_dataproto(hs_output)
+    # ── HS collector colocate hooks (mirror _compute_teacher_colocate) ────────────
+
+    def _should_compute_hidden_states_colocate(self, batch: DataProto) -> bool:
+        return self.use_hs_collector and self.hs_collector_manager is not None
+
+    def _compute_hidden_states_colocate(self, batch: DataProto) -> DataProto:
+        """Collect hidden states after rollout when HS collector and actor are colocated."""
+        assert self.hs_collector_manager is not None, "HSCollectorManager is None"
+        return self.hs_collector_manager.compute_hidden_states(batch)
+
+    def _run_drafter_sub_pipeline(self, batch: DataProto, timing_raw: dict, metrics: dict):
+        """HS collection (colocated) → sample pool → mesh dispatch → drafter training."""
+        if not self._should_compute_hidden_states_colocate(batch):
+            return
+
+        with marked_timer("drafter", timing_raw, color="cyan"):
+            hs_batch = self._compute_hidden_states_colocate(batch)
+            sample_metas = _sample_metas_from_hs_batch(hs_batch)
             self._drafter_ctrl.push_samples(sample_metas)
 
-            # Phase 3: Drain → dispatch to drafter trainers
             drafter_proto = self._drafter_ctrl.drain_as_dataproto()
             if drafter_proto is not None:
                 self.actor_rollout_wg.update_drafter(drafter_proto)
-                status = self._drafter_ctrl.get_status()
                 metrics["drafter/samples_trained"] = len(sample_metas)
 
     def fit(self):
@@ -271,13 +242,6 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
-                    # ── Drafter co-training sub-pipeline ─────────────
-                    # Runs after rollout (replicas sleeping), before reward.
-                    # Phase 1: push rollout → Level 1
-                    # Phase 2: HS collection (vLLM prefill → Mooncake)
-                    # Phase 3: drain → dispatch → drafter training
-                    self._run_drafter_sub_pipeline(gen_batch_output, timing_raw, metrics)
-
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -313,6 +277,11 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
                         with marked_timer("teacher", timing_raw, color="cyan"):
                             batch_teacher = self._compute_teacher_colocate(batch)
                             batch = batch.union(batch_teacher)
+
+                    # Drafter HS collection (colocated, post-rollout).
+                    # HS collector vLLM wakes, runs prefill, writes Mooncake, sleeps.
+                    # Metadata then flows: controller → drafter mesh dispatch → drafter training.
+                    self._run_drafter_sub_pipeline(batch, timing_raw, metrics)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -472,6 +441,10 @@ class RayDrafterCTPPOTrainer(RayPPOTrainer):
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
+                            if self.hs_collector_manager is not None:
+                                # HS collector mirrors the actor; re-sync after actor update.
+                                # (update_weights is a TODO stub — see HSCollectorManager.)
+                                self.hs_collector_manager.update_weights(params=None)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

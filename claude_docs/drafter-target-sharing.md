@@ -1,6 +1,6 @@
 # Drafter–Target Parameter & Data Sharing
 
-Reference: TorchSpec (`reference/TorchSpec/torchspec/`)
+Reference: Ported from TorchSpec; locations below reflect the verl implementation.
 
 ---
 
@@ -13,8 +13,8 @@ Reference: TorchSpec (`reference/TorchSpec/torchspec/`)
 | `norm` | `draft_model.norm` | Draft model's own | **Yes** | Draft model's RMSNorm (used in loss kernel) |
 | `fc` | `draft_model.fc` | Draft model's own (new projection layer) | **Yes** | Fuses [hidden_state, token_embed, pos_info] (3*D -> D) |
 | `midlayer` | `draft_model.midlayer` | Draft model's own | **Yes** | 1 transformer decoder layer |
-| `target_lm_head_weight` | `eagle3_trainer.target_lm_head_weight` | Loaded from target via `TargetLMHead` | No | Computes target distribution (Forward KL "labels") |
-| `verifier_norm` | `eagle3_trainer.verifier_norm` | Loaded from target via `TargetLMHead` | No | Normalizes pre-norm hidden states before target logit computation |
+| `target_lm_head_weight` | `FSDPDrafterEngine._target_lm_head_weight` | Copied from actor's `lm_head.weight` | No | Computes target distribution (Forward KL "labels") |
+| `verifier_norm` | `FSDPDrafterEngine._verifier_norm` | Copied from actor's `model.norm` | No | Normalizes pre-norm hidden states before target logit computation |
 
 ### Key distinction: two lm_heads
 
@@ -25,20 +25,23 @@ These are **not** the same tensor. The draft model learns its own output project
 
 ---
 
-## Frozen modules: how they're loaded in TorchSpec
+## Frozen modules: how they're synced in verl
+
+In verl the actor IS the target model and trains every RL step. Frozen modules are **weight copies** (not live references — FSDP-safe), re-synced after each `update_actor()`.
 
 ### embed_tokens
 
-- `Eagle3Trainer.init_model()` calls `draft_model.load_embedding(target_model_path)` (loads from target)
-- Then `draft_model.freeze_embedding()` sets `embed_tokens.weight.requires_grad = False`
-- See: `torchspec/models/draft/base.py:187-246`
+- `draft_model.load_embedding(target_model_path)` loads from target checkpoint at init
+- `draft_model.freeze_embedding()` sets `embed_tokens.weight.requires_grad = False`
+- Re-synced via `sync_frozen_modules_from_actor()` after each `update_actor()`
+- See: `verl/models/eagle3/draft/base.py:187-191`, `verl/workers/engine/fsdp/drafter_impl.py:132`
 
 ### target_lm_head_weight + verifier_norm
 
-- `Eagle3Trainer._init_target_lm_head(target_model_path)` loads a `TargetLMHead` object
-- `TargetLMHead` contains `lm_head.weight` and optionally `norm` (when `last_hidden_states_prenorm=True`)
-- Loaded from target checkpoint, broadcast across ranks, kept frozen
-- See: `torchspec/training/eagle3_trainer.py:188-229`
+- Stored as private attributes on `FSDPDrafterEngine` (`_target_lm_head_weight`, `_verifier_norm`)
+- Copied from actor model at init and re-synced after each `update_actor()`
+- `_sync_drafter_frozen_modules()` in `drafter_workers.py` calls `engine.sync_frozen_modules_from_actor(embed, lm_head, norm)`
+- See: `verl/workers/engine/fsdp/drafter_impl.py:137-150`, `verl/workers/drafter_workers.py:123-153`
 
 ---
 

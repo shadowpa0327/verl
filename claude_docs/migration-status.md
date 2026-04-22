@@ -45,16 +45,18 @@ generate_sequences()
 
 | Component | verl File(s) | What it does |
 |---|---|---|
-| **Mooncake store** | `verl/utils/mooncake/` (9 files, ~2,200 lines) | put/get/remove API, RDMA/TCP buffers, config, deferred_delete, master process |
+| **Mooncake store** | `verl/utils/mooncake/` (9 files, ~2,580 lines) | put/get/remove API, RDMA/TCP buffers, config, deferred_delete, master process |
 | **KV connector** | `verl/utils/mooncake/hidden_states_connector.py` | vLLM `KVConnectorBase_V1` — writes HS to Mooncake during prefill |
 | **Eagle3 model** | `verl/models/eagle3/eagle3_model.py` | `Eagle3Model`: 7-step TTT loop, `PrecomputedTarget`/`LazyTarget`, `_calculate_loss()` |
 | **Forward KL loss** | `verl/models/eagle3/ops/loss.py` | `compiled_forward_kl_loss` / `compiled_forward_kl_loss_from_hs` (torch.compiled) |
-| **Draft models** | `verl/models/eagle3/draft/` (4 files, ~2,150 lines) | `LlamaForCausalLMEagle3` (fc + midlayer), `AutoEagle3DraftModel` factory, base ABC |
-| **VllmHSCollector** | `verl/workers/rollout/.../vllm_hs_collector.py` (~475 lines) | vLLM with `extract_hidden_states` config + `MooncakeHiddenStatesConnector` |
+| **Draft models** | `verl/models/eagle3/draft/` (4 files, ~2,170 lines) | `LlamaForCausalLMEagle3` (fc + midlayer), `AutoEagle3DraftModel` factory, base ABC |
+| **HSCollectorManager** | `verl/experimental/hs_collector/` (~200 lines) | Clone of `TeacherModelManager` in colocated mode. Spawns vLLM replicas with `MooncakeHiddenStatesConnector` + `extract_hidden_states`. Called sync from trainer post-rollout. |
 | **DrafterDataController** | `verl/trainer/drafter/controller.py` (~165 lines) | 2-level pipeline (raw_prompts, sample_pool) + `drain_as_dataproto()` |
 | **Orchestration sketch** | `verl/trainer/drafter/orchestration.py` (~97 lines) | Documents insertion points in `RayPPOTrainer.fit()` |
-| **FSDPDrafterEngine** | `verl/workers/engine/fsdp/drafter_impl.py` (~190 lines) | `initialize()`: wraps `Eagle3Model(draft_model, length=7)` with FSDP. `prepare_model_inputs()`: applies `verifier_norm`, builds `LazyTarget`. `sync_frozen_modules_from_actor()`: copies embed_tokens, lm_head, verifier_norm, target_lm_head_weight from actor. |
-| **Worker skeleton** | `verl/workers/drafter_workers.py` (~240 lines) | `ActorRolloutRefDrafterWorker`: `collect_hidden_states()` + `update_drafter()` registered. `_sync_drafter_frozen_modules()` called at init + after `update_actor()`. |
+| **FSDPDrafterEngine** | `verl/workers/engine/fsdp/drafter_impl.py` (~217 lines) | `initialize()`: wraps `Eagle3Model(draft_model, length=7)` with FSDP. `prepare_model_inputs()`: applies `verifier_norm`, builds `LazyTarget`. `sync_frozen_modules_from_actor()`: copies embed_tokens, lm_head, verifier_norm, target_lm_head_weight from actor. |
+| **Worker skeleton** | `verl/workers/drafter_workers.py` (~266 lines) | `ActorRolloutRefDrafterWorker`: `collect_hidden_states()` + `update_drafter()` registered. `_sync_drafter_frozen_modules()` called at init + after `update_actor()`. |
+| **Drafter CT Trainer** | `verl/trainer/drafter/drafter_ct_ray_trainer.py` (~561 lines) | `RayDrafterCTPPOTrainer`: subclass of `RayPPOTrainer` with full drafter sub-pipeline in `fit()`. |
+| **Entry point** | `verl/trainer/drafter/main_drafter_ct_ppo.py` (~139 lines) | `DrafterCTTaskRunner`: entry point that wires `ActorRolloutRefDrafterWorker` + `RayDrafterCTPPOTrainer`. |
 
 ### TODO — In Implementation Order
 
@@ -73,25 +75,15 @@ The engine is ready (`prepare_model_inputs()` handles verifier_norm + LazyTarget
 
 **TorchSpec ref:** `training/data_fetcher.py:79-113` (Mooncake fetch), `training/eagle3_trainer.py:235-277` (forward/backward)
 
-#### TODO 2: Sleep/wake coordination ← **Blocker**
+#### ~~TODO 2: Sleep/wake coordination~~ ← **Done**
 
-**File:** `drafter_workers.py` (has `# TODO` markers)
+Handled by `HSCollectorManager.compute_hidden_states()` (wake → infer → sleep) which wraps verl's `RolloutReplica` lifecycle. The manager replaces the previous hand-rolled `VllmHSCollector` + bespoke sleep/wake path.
 
-GPU time-multiplexing sequence:
-- In `collect_hidden_states()`: `rollout.release()` → `hs_collector.resume()` → ... → `hs_collector.release()`
-- In `update_drafter()`: `drafter.engine.to("cuda")` → ... → `drafter.engine.to("cpu")`
+#### ~~TODO 3: `RayPPOTrainer.fit()` integration~~ ← **Done**
 
-Follow existing pattern in `ActorRolloutRefWorker.update_weights()`.
-
-#### TODO 3: `RayPPOTrainer.fit()` integration ← **Blocker**
-
-**File:** `verl/trainer/ppo/ray_trainer.py`
-**Sketch:** `verl/trainer/drafter/orchestration.py`
-
-Three changes:
-1. `__init__`: Create `DrafterDataController` if drafter enabled
-2. `fit()`: Insert drafter sub-pipeline after `generate_sequences()`, before `compute_reward()`
-3. Worker class: Use `ActorRolloutRefDrafterWorker` when drafter enabled
+Implemented as a subclass rather than modifying base `RayPPOTrainer`:
+- `RayDrafterCTPPOTrainer` (`verl/trainer/drafter/drafter_ct_ray_trainer.py`, ~561 lines) — full drafter sub-pipeline in `fit()`
+- `DrafterCTTaskRunner` (`verl/trainer/drafter/main_drafter_ct_ppo.py`, ~139 lines) — entry point wiring
 
 #### TODO 4: Drafter → rollout weight sync ← Not a blocker
 
@@ -102,6 +94,16 @@ Push drafter weights to rollout vLLM for speculative decoding. Needs rollout to 
 #### TODO 5: Config schema (YAML) ← Not a blocker
 
 Add `drafter:` section to verl config: `model_path`, `ttt_length`, `learning_rate`, `aux_hidden_states_layers`, `mooncake` sub-config. Can hardcode initially.
+
+---
+
+## Files Deleted (superseded by HSCollectorManager)
+
+| File | Reason |
+|---|---|
+| `verl/workers/rollout/vllm_rollout/vllm_hs_collector.py` | Hand-rolled Ray actor replaced by `HSCollectorManager` (clone of colocated `TeacherModelManager`). |
+| `scripts/test_real_hs_collector.py` | Superseded by `scripts/test_hs_collector.py`. |
+| `scripts/test_hs_collector_verl.py` | Superseded by `scripts/test_hs_collector.py`. |
 
 ---
 

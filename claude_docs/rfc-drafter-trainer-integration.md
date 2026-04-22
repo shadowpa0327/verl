@@ -1,5 +1,7 @@
 # RFC: Drafter Trainer Integration in verl
 
+> **Revision (2026-04-22):** HS collection mechanism changed from the bespoke `VllmHSCollector` Ray actor to `HSCollectorManager` — a clone of verl's colocated `TeacherModelManager`. Called sync from the trainer after rollout (parallel to `_compute_teacher_colocate`). Data lifecycle (sample_pool → drafter mesh dispatch) is unchanged. See `tasks/hs-collector-plan.md`.
+
 ## Goal
 
 Add EAGLE drafter co-training to verl's RL pipeline. The drafter trains on hidden states extracted from the target model via **dedicated vLLM inference workers** (separate from rollout).
@@ -618,6 +620,8 @@ class FSDPDrafterEngine(FSDPEngine):
 ---
 
 ## Open Questions
+
+> **Note:** Items marked RESOLVED have code written but `update_drafter()` body (TODO 1) and sleep/wake coordination (TODO 2) are still stubs. These components exist in isolation but are not yet integrated into a working end-to-end training loop.
 
 1. ~~**Mooncake setup**~~ **RESOLVED**: `MooncakeMaster` Ray actor in `verl/utils/mooncake/master.py`. Per-node store instances, global master.
 
