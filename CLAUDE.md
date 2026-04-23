@@ -24,7 +24,7 @@ See **[`claude_docs/project-guide.md`](./claude_docs/project-guide.md)** for the
 |---|---|
 | `claude_docs/project-guide.md` | Full project context — architecture, files, testing |
 | `claude_docs/migration-status.md` | **Current state** — what's done, TODOs (ordered), verification checklist |
-| `claude_docs/rfc-drafter-trainer-integration.md` | **Design (locked)** — data lifecycle, dispatch, worker hierarchy |
+| `claude_docs/drafter-design.md` | **As-built design** — data lifecycle, dispatch, worker hierarchy, training-step shape |
 | `claude_docs/torchspec-to-verl-migration-map.md` | **Reference** — TorchSpec internals + file-by-file connection map |
 | `claude_docs/weight-sync-flows.md` | Weight sync between actor, rollout, HS collector, drafter |
 | `claude_docs/workflow-orchestration.md` | Workflow rules for this project |

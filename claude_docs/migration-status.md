@@ -4,7 +4,7 @@ Compact status snapshot. Detailed RCA, change log, and per-fix
 rationale all live in **`git log`** on `feat/drafter-cotraining`
 (parent) and `feat/drafter-cotraining` (recipe submodule).
 
-**Design:** `rfc-drafter-trainer-integration.md`
+**Design:** `drafter-design.md`
 **TorchSpec mapping:** `torchspec-to-verl-migration-map.md`
 **Workflow:** `project-guide.md` → "Where to make changes — recipe submodule first"
 

@@ -105,7 +105,7 @@ Keep `scripts/test_mooncake_store.py` and `scripts/test_vllm_hs_collector.py`.
 | `claude_docs/weight-sync-flows.md` | Flow 2 rewrite: HS collector owned by `HSCollectorManager` (colocated replicas), synced via `.update_weights(actor_params)` from trainer, not worker. Timing diagram stays the same (sequential post-rollout). |
 | `claude_docs/migration-status.md` | HS collector row: `HSCollectorManager`. Close TODO 2 (sleep/wake handled by manager). List deleted files. |
 | `claude_docs/project-guide.md` | Architecture + file table: remove `vllm_hs_collector.py`, add `verl/experimental/hs_collector/`. |
-| `claude_docs/rfc-drafter-trainer-integration.md` | One-line revision note: "HS collector mechanism changed to `HSCollectorManager` (colocated, post-rollout, sync). Data lifecycle unchanged." |
+| `claude_docs/drafter-design.md` | (RFC superseded by this as-built doc; HS collector covered as `HSCollectorManager` (colocated, post-rollout, sync) directly.) |
 | `claude_docs/torchspec-to-verl-migration-map.md` | HS Collection row: point to new files. |
 | `CLAUDE.md` | Doc table only if file names changed. |
 

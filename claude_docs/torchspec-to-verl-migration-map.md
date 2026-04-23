@@ -92,4 +92,4 @@ verifier then accepts/rejects the speculated tokens.
   `verl/.../mooncake/` etc. — that's the deleted in-tree mirror).
 - See `weight-sync-flows.md` for parameter / data flows.
 - See `migration-status.md` for current state + open TODOs.
-- See `rfc-drafter-trainer-integration.md` for design rationale.
+- See `drafter-design.md` for the as-built architecture and rationale.

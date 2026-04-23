@@ -104,7 +104,7 @@ it to parent then.
 | Doc | Role | What |
 |---|---|---|
 | `claude_docs/migration-status.md` | **Current state** | What's done, what's TODO (ordered), frozen module sync, verification checklist |
-| `claude_docs/rfc-drafter-trainer-integration.md` | **Design (locked)** | Why: 3-level pipeline, DrafterDataController, sleep/wake, dispatch mechanism |
+| `claude_docs/drafter-design.md` | **As-built design** | Architecture, data lifecycle, training-step shape, engine-choice rationale |
 | `claude_docs/torchspec-to-verl-migration-map.md` | **Reference** | TorchSpec internals + file-by-file connection map to verl |
 
 ### Testing
