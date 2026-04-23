@@ -48,17 +48,56 @@ RayDrafterCTPPOTrainer (driver)
 - **No unanimity gate** — the centralized controller + mesh dispatch guarantees all ranks get data or none do. Consensus by construction.
 - **Pre-norm handling** — vLLM captures `last_hidden_states` before the final RMSNorm (pre-norm). `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` (a frozen copy of the actor's `model.norm`) to normalize before target distribution computation. Note: the loss kernel's built-in RMSNorm is for the *draft* model's norm, not the verifier — these are separate.
 
-### Migration Files (branch `feat/drafter-cotraining`)
+### Where to make changes — recipe submodule first
 
-| Directory | What | Lines |
-|---|---|---|
-| `verl/utils/mooncake/` | Mooncake KV store (config, put/get/remove, buffers, KV connector) | ~2,580 |
-| `verl/models/eagle3/` | Eagle3 model (draft arch, Forward KL loss, TTT loop) | ~2,690 |
-| `verl/trainer/drafter/` | DrafterDataController, orchestration, CT trainer, entry point | ~963 |
-| `verl/workers/drafter_workers.py` | ActorRolloutRefDrafterWorker | ~266 |
-| `verl/workers/engine/fsdp/drafter_impl.py` | FSDPDrafterEngine ("drafter_model") | ~217 |
-| `verl/experimental/hs_collector/` | `HSCollectorManager` + `AsyncHSCollectorServerManager` (clone of teacher colocate) | ~200 |
-| `scripts/test_*.py` | Test scripts (5 files: Mooncake, HS collector, controller, e2e) | ~2,145 |
+**All drafter-private code lives in the `recipe/drafter_cotraining/`
+submodule** (a git submodule pointing at `shadowpa0327/verl-recipe`,
+branch `feat/drafter-cotraining`). The in-tree `verl/...` mirrors that
+existed during the migration have been **deleted** as of 2026-04-23
+(see `migration-status.md` "cleanup" entry).
+
+**Default rule for new work:**
+
+> *Put changes in `recipe/drafter_cotraining/` whenever it can fit there.
+> Touch `verl/...` (parent) only when you genuinely need to extend
+> verl-side base infrastructure or when the parent change is so small
+> that mirroring through the submodule would be more friction than
+> value.*
+
+Concrete guidance:
+
+| Change kind | Where it goes |
+|---|---|
+| Drafter worker / engine logic | `recipe/drafter_cotraining/{fsdp_workers,drafter_engine}.py` |
+| Eagle3 model / loss / draft | `recipe/drafter_cotraining/eagle3/...` |
+| Mooncake transfer / KV connector | `recipe/drafter_cotraining/mooncake/...` |
+| HS collector manager | `recipe/drafter_cotraining/hs_collector/...` |
+| Drafter trainer / controller | `recipe/drafter_cotraining/{ray_trainer,controller,main_drafter_ct,orchestration}.py` |
+| Test / smoke scripts | `recipe/drafter_cotraining/scripts/...` |
+| Drafter unit tests | `recipe/drafter_cotraining/tests/...` |
+| Drafter YAML config / draft model JSONs | `recipe/drafter_cotraining/config/...` |
+| Top-level smoke wrappers | `scripts/run_drafter_*.sh` (parent — they shell out to recipe scripts) |
+| Drafter→rollout weight sync (TODO 4) | parent `verl/workers/rollout/vllm_rollout/...` (parent must grow the receiving end) |
+| New verl base-class hooks (FSDPEngine, RayPPOTrainer, dispatch modes) | parent `verl/...` |
+| Design / status docs | parent `claude_docs/...` |
+
+**Submodule workflow** for recipe changes:
+
+```bash
+cd recipe/drafter_cotraining
+# edit, test, commit on feat/drafter-cotraining (or topic branch)
+git push origin2 feat/drafter-cotraining
+
+cd /root/verl                           # parent
+git add recipe                          # stage gitlink bump
+git commit -m "[drafter] bump recipe submodule: <topic>"
+git push                                # parent stays on feat/drafter-cotraining (or your topic branch)
+```
+
+**When in doubt** — start in the recipe. If you find yourself needing
+to subclass / monkey-patch a verl base class repeatedly, that's a
+signal that a small parent-side hook would be the cleaner fix; promote
+it to parent then.
 
 ### Key Documents
 
@@ -70,18 +109,34 @@ RayDrafterCTPPOTrainer (driver)
 
 ### Testing
 
+Smoke wrappers (live in parent — shell into the recipe-side tests):
+
+```bash
+# Rollout + HS collection + mesh dispatch (no drafter training)
+./scripts/run_drafter_rollout_hs.sh
+
+# Close-loop drafter training (rollout → HS → forward → backward → opt step)
+./scripts/run_drafter_training.sh                    # MAX_STEPS=32 default
+MAX_STEPS=16 ./scripts/run_drafter_training.sh       # quick smoke
+```
+
+Recipe-side test/diag scripts (run directly):
+
 ```bash
 # Mooncake store put/get/remove cycle (needs mooncake_master)
-python scripts/test_mooncake_store.py
+python recipe/drafter_cotraining/scripts/test_mooncake_store.py
 
 # Mooncake round-trip with configurable shapes (needs mooncake_master)
-python scripts/test_vllm_hs_collector.py --seq-len 256 --hidden-dim 3584 --num-samples 5
+python recipe/drafter_cotraining/scripts/test_vllm_hs_collector.py --seq-len 256 --hidden-dim 3584 --num-samples 5
 
 # Single-controller simulation of drafter pipeline
-python scripts/test_single_controller_hs.py
+python recipe/drafter_cotraining/scripts/test_single_controller_hs.py
 
 # Standalone HSCollectorManager end-to-end: vLLM → Mooncake → reader (needs GPU + mooncake_master)
-python scripts/test_hs_collector.py --model Qwen/Qwen2.5-0.5B-Instruct
+python recipe/drafter_cotraining/scripts/test_hs_collector.py --model Qwen/Qwen2.5-0.5B-Instruct
+
+# Eagle3 loss kernel unit tests
+pytest recipe/drafter_cotraining/tests/test_eagle3_loss.py
 ```
 
 ---
@@ -102,7 +157,7 @@ Handles gradient computation: forward/backward/optimizer.
 ```
 BaseEngine
 ├── FSDPEngine           (engine/fsdp/transformer_impl.py)
-├── FSDPDrafterEngine    (engine/fsdp/drafter_impl.py)        ← NEW
+├── FSDPDrafterEngine    (recipe/drafter_cotraining/drafter_engine.py)   ← submodule
 ├── MegatronEngine       (engine/megatron/transformer_impl.py)
 ├── VeOmniEngine         (engine/veomni/transformer_impl.py)
 └── MindspeedEngine      (engine/mindspeed/transformer_impl.py)

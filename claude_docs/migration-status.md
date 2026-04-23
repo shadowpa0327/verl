@@ -7,6 +7,16 @@ Single source of truth for what's done, what's TODO, and how to verify.
 
 ---
 
+## Where to make changes (post-cleanup)
+
+**Recipe submodule first.** All drafter library code lives in
+`recipe/drafter_cotraining/`. Touch parent `verl/...` only for
+verl-side base-class hooks, vLLM rollout integration, top-level
+wrapper scripts, or docs. Full guidance + workflow snippet in
+`project-guide.md` → "Where to make changes — recipe submodule first".
+
+---
+
 ## 2026-04-23 (cleanup) — In-tree drafter mirrors deleted
 
 The recipe submodule (`recipe/drafter_cotraining/`) is now the **only**
