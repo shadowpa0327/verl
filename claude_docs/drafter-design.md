@@ -241,7 +241,7 @@ on every rank at init:
 
 | Weight | Read from key | Lives at | Source order |
 |---|---|---|---|
-| `embed_tokens.weight` | `model.embed_tokens.weight` | `Eagle3Model.draft_model.embed_tokens` | `_build_module` (pre-FSDP wrap, on every rank) |
+| `embed_tokens.weight` | `model.embed_tokens.weight` | `Eagle3Model.draft_model.embed_tokens` | `_build_module` (pre-FSDP wrap, on every rank). The draft *architecture* itself is auto-derived from `target_model_path` via `generate_draft_model_config` (`eagle3/draft/auto.py`) — `local_path` is an optional template overlay only needed for vocab pruning or non-Llama drafts. |
 | `lm_head.weight` (`target_lm_head_weight`) | `lm_head.weight`, fallback `model.embed_tokens.weight` if `tie_word_embeddings=True` | `FSDPDrafterEngine._target_lm_head_weight` | `initialize` → `_load_target_frozen_weights` |
 | `model.norm.weight` (`verifier_norm`) | `model.norm.weight` | `FSDPDrafterEngine._verifier_norm` (a `LlamaRMSNorm` module) | `initialize` → `_load_target_frozen_weights` |
 

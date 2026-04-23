@@ -20,10 +20,12 @@ MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B}"
 TRAIN_FILE="${TRAIN_FILE:-$HOME/data/gsm8k/train.parquet}"
 VAL_FILE="${VAL_FILE:-$HOME/data/gsm8k/test.parquet}"
 
-# Draft model config — defaults to the Qwen3-4B Eagle3 config shipped in
-# recipe/drafter_cotraining/config/draft_models/ (draft_vocab_size omitted so
-# vocab_pruning stays off and we run the LazyTarget path).
-DRAFT_CONFIG="${DRAFT_CONFIG:-$RECIPE_DIR/config/draft_models/qwen3_4b_eagle3.json}"
+# Draft architecture is auto-derived from MODEL_PATH by default — see
+# generate_draft_model_config() in recipe/.../eagle3/draft/auto.py. Only
+# pass an explicit template via "$@" if you need vocab pruning, MLA, or
+# another non-default architecture, e.g.:
+#   ./scripts/run_drafter_training.sh \
+#     actor_rollout_ref.drafter.model_config.local_path=/path/to/template.json
 
 # Qwen3-4B has 36 layers. TorchSpec's "post-layer N" defaults are
 # [1, n/2-1, n-4, n-1] = [1, 17, 32, 35]; vLLM's hook fires at the *input* of
@@ -44,7 +46,7 @@ N_GPUS="${N_GPUS:-2}"
 
 # MAX_STEPS also drives the cosine LR schedule — see §4.7 of the milestone
 # plan. Keep >= 16 for a visible loss/acc_len trend.
-MAX_STEPS="${MAX_STEPS:-32}"
+MAX_STEPS="${MAX_STEPS:-1000}"
 
 DRAFTER_LR="${DRAFTER_LR:-1.0e-4}"
 DRAFTER_WARMUP_RATIO="${DRAFTER_WARMUP_RATIO:-0.015}"
@@ -59,9 +61,6 @@ for f in "$TRAIN_FILE" "$VAL_FILE"; do
         echo "ERROR: data file missing: $f"; exit 1
     fi
 done
-if [ ! -f "$DRAFT_CONFIG" ]; then
-    echo "ERROR: DRAFT_CONFIG not found: $DRAFT_CONFIG"; exit 1
-fi
 if [ ! -d "$MODEL_PATH" ]; then
     echo "WARN: MODEL_PATH not a local dir — HF download will trigger: $MODEL_PATH"
 fi
@@ -110,7 +109,6 @@ python "$RECIPE_DIR/scripts/test_drafter_training.py" \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.drafter.enable=True \
-    actor_rollout_ref.drafter.model_config.local_path="$DRAFT_CONFIG" \
     actor_rollout_ref.drafter.optimizer_config.lr="$DRAFTER_LR" \
     actor_rollout_ref.drafter.optimizer_config.lr_warmup_steps_ratio="$DRAFTER_WARMUP_RATIO" \
     actor_rollout_ref.drafter.optimizer_config.clip_grad="$DRAFTER_CLIP_GRAD" \
