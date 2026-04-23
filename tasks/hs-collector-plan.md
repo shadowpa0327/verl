@@ -109,7 +109,8 @@ Keep `scripts/test_mooncake_store.py` and `scripts/test_vllm_hs_collector.py`.
 | `claude_docs/torchspec-to-verl-migration-map.md` | HS Collection row: point to new files. |
 | `CLAUDE.md` | Doc table only if file names changed. |
 
-`drafter-target-sharing.md` — no change.
+`weight-sync-flows.md` — covers parameter inventory + sync flows
+(folded `drafter-target-sharing.md` into it).
 
 ## Open items (handle when hit)
 
