@@ -299,8 +299,15 @@ class vLLMColocateWorkerExtension:
                 return
             if shared_names:
                 weights = [(name, weight) for name, weight in weights if name not in shared_names]
-            drafter.model.load_weights(weights)
-            logger.info(f"vLLM drafter load weights, loaded_params: {len(weights)}")
+            if not weights:
+                return
+            state_keys = set(drafter.model.state_dict().keys())
+            if all(name in state_keys for name, _ in weights):
+                drafter.model.load_state_dict(dict(weights), strict=False)
+                logger.info(f"vLLM drafter load state_dict weights, loaded_params: {len(weights)}")
+            else:
+                drafter.model.load_weights(weights)
+                logger.info(f"vLLM drafter load weights, loaded_params: {len(weights)}")
         else:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -388,8 +395,14 @@ class vLLMColocateWorkerExtension:
         if drafter_model is None:
             return {"ok": False, "reason": "no drafter / drafter has no .model", "rank": getattr(self, "rank", None)}
 
+        import tempfile
+
+        rank = getattr(self, "rank", None)
         weights = [(name, tensor.detach().cpu().clone()) for name, tensor in drafter_model.state_dict().items()]
-        return {"ok": True, "rank": getattr(self, "rank", None), "weights": weights}
+        fd, path = tempfile.mkstemp(prefix=f"verl_drafter_weights_rank{rank}_", suffix=".pt")
+        os.close(fd)
+        torch.save(weights, path)
+        return {"ok": True, "rank": rank, "weights_path": path, "num_tensors": len(weights)}
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
@@ -496,8 +509,15 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
                 return
             if shared_names:
                 weights = [(name, weight) for name, weight in weights if name not in shared_names]
-            drafter.model.load_weights(weights)
-            logger.info(f"vLLM-Omni drafter load weights, loaded_params: {len(weights)}")
+            if not weights:
+                return
+            state_keys = set(drafter.model.state_dict().keys())
+            if all(name in state_keys for name, _ in weights):
+                drafter.model.load_state_dict(dict(weights), strict=False)
+                logger.info(f"vLLM-Omni drafter load state_dict weights, loaded_params: {len(weights)}")
+            else:
+                drafter.model.load_weights(weights)
+                logger.info(f"vLLM-Omni drafter load weights, loaded_params: {len(weights)}")
         else:
             logger.info("Loading standard weights (async)")
             self.load_weights(weights)
@@ -577,8 +597,14 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
         if drafter_model is None:
             return {"ok": False, "reason": "no drafter / drafter has no .model", "rank": getattr(self, "rank", None)}
 
+        import tempfile
+
+        rank = getattr(self, "rank", None)
         weights = [(name, tensor.detach().cpu().clone()) for name, tensor in drafter_model.state_dict().items()]
-        return {"ok": True, "rank": getattr(self, "rank", None), "weights": weights}
+        fd, path = tempfile.mkstemp(prefix=f"verl_drafter_weights_rank{rank}_", suffix=".pt")
+        os.close(fd)
+        torch.save(weights, path)
+        return {"ok": True, "rank": rank, "weights_path": path, "num_tensors": len(weights)}
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""

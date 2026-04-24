@@ -13,7 +13,7 @@
 - One task per subagent for focused execution
 
 ## 3. Self-Improvement Loop
-- After ANY correction from the user: capture the lesson (memory or inline note)
+- After ANY correction from the user: capture the lesson (memory or inline note, you can use `tasks/lesson.md` to take the note)
 - Write rules for yourself that prevent the same mistake
 - Ruthlessly iterate on these lessons until mistake rate drops
 - Review lessons at session start for relevant project

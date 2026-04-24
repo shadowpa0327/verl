@@ -97,10 +97,11 @@ class ServerAdapter(BaseRollout):
         self.device_uuid = get_device_uuid(get_device_id())
         self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
 
-        self.use_shm = not is_support_ipc()
+        force_shm = os.getenv("VERL_VLLM_FORCE_WEIGHT_SHM", "").lower() in {"1", "true", "yes"}
+        self.use_shm = force_shm or not is_support_ipc()
         if self.use_shm:
             logger.warning(
-                "IPC is not supported on your devices. Falling back to shared memory for weight transfer, "
+                "CUDA IPC weight transfer is disabled or unsupported. Falling back to shared memory, "
                 "which may cause performance degradation. If you are using Ascend NPUs, please ensure that "
                 "your software and CANN toolkit versions meet the requirements for IPC support. (Ascend HDK version "
                 ">= 25.3.rc1 and CANN toolkit version >= 8.3.RC1)"
