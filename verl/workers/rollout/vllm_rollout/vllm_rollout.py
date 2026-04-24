@@ -183,6 +183,47 @@ class ServerAdapter(BaseRollout):
         if self.replica_rank == 0 and self.rollout_rank == 0:
             logger.info(f"update_weights done, time cost: {time.time() - start_time:.2f}s")
 
+    @torch.no_grad()
+    async def update_drafter_weights(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        **kwargs,
+    ):
+        """Sync FSDP drafter weights into the vLLM speculative-decoding proposer."""
+        start_time = time.time()
+
+        future = await self._execute_method(
+            "update_weights_from_ipc",
+            non_block=True,
+            kwargs={**kwargs, "use_shm": self.use_shm, "target_model": "drafter"},
+        )
+
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        await sender.async_send_weights(weights)
+
+        if future is not None:
+            await future
+
+        if self.replica_rank == 0 and self.rollout_rank == 0:
+            logger.info(f"update_drafter_weights done, time cost: {time.time() - start_time:.2f}s")
+
+    async def get_drafter_weights(self):
+        """Return per-vLLM-worker drafter weights for test restore snapshots."""
+        return await self._execute_method("get_drafter_weights")
+
+    async def inspect_drafter_sharing(self):
+        """Return per-vLLM-worker drafter/target sharing reports."""
+        return await self._execute_method("inspect_drafter_sharing")
+
+    async def probe_target_param_norms(self):
+        """Return per-vLLM-worker target embed/lm_head norms."""
+        return await self._execute_method("probe_target_param_norms")
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Batch generate sequences in sync mode.
 

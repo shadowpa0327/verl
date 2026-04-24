@@ -183,12 +183,26 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
         )
+
+    async def get_spec_decode_counters(self) -> dict[str, int]:
+        """Read vLLM speculative-decoding counters from the server process."""
+        from vllm.v1.metrics.reader import Counter, get_metrics_snapshot
+
+        counters = {"num_drafts": 0, "num_accepted_tokens": 0}
+        for metric in get_metrics_snapshot():
+            if metric.name == "vllm:spec_decode_num_drafts":
+                if isinstance(metric, Counter):
+                    counters["num_drafts"] += int(metric.value)
+            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                if isinstance(metric, Counter):
+                    counters["num_accepted_tokens"] += int(metric.value)
+        return counters
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:

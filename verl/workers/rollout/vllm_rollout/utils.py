@@ -176,7 +176,26 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def _collect_shared_drafter_param_names(self, drafter_model) -> set[str]:
+        """Names of drafter params whose storage is the main model's."""
+        main_ptrs = {
+            p.data_ptr()
+            for p in self.model_runner.model.parameters()
+            if p.is_floating_point()
+        }
+        return {
+            name
+            for name, p in drafter_model.named_parameters()
+            if p.is_floating_point() and p.data_ptr() in main_ptrs
+        }
+
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        target_model: str = "main",
+    ):
         """Update the weights of the rollout model."""
         from vllm.platforms import current_platform
 
@@ -214,9 +233,24 @@ class vLLMColocateWorkerExtension:
             device=self.device,
             use_shm=use_shm,
         )
+        shared_names: set[str] = set()
+        if target_model == "drafter":
+            drafter = getattr(self.model_runner, "drafter", None)
+            if drafter is not None and getattr(drafter, "model", None) is not None:
+                shared_names = self._collect_shared_drafter_param_names(drafter.model)
+                if shared_names:
+                    logger.info(
+                        f"drafter shares {len(shared_names)} params with main model; "
+                        f"filtering from drafter update: {sorted(shared_names)[:5]}..."
+                    )
+
         receiver.receive_weights(
             on_bucket_received=lambda weights: self._update_weights(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
+                weights,
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                target_model=target_model,
+                shared_names=shared_names,
             )
         )
 
@@ -239,7 +273,14 @@ class vLLMColocateWorkerExtension:
             model_config = self.model_runner.vllm_config.model_config
             process_weights_after_loading(model, model_config, self.device)
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        peft_config: dict,
+        base_sync_done: bool,
+        target_model: str = "main",
+        shared_names: set[str] | None = None,
+    ):
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -251,6 +292,15 @@ class vLLMColocateWorkerExtension:
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+        elif target_model == "drafter":
+            drafter = getattr(self.model_runner, "drafter", None)
+            if drafter is None or getattr(drafter, "model", None) is None:
+                logger.debug("drafter weight update skipped (no drafter on this rank)")
+                return
+            if shared_names:
+                weights = [(name, weight) for name, weight in weights if name not in shared_names]
+            drafter.model.load_weights(weights)
+            logger.info(f"vLLM drafter load weights, loaded_params: {len(weights)}")
         else:
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
@@ -262,6 +312,84 @@ class vLLMColocateWorkerExtension:
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 self.model_runner.model.load_weights(weights)
+
+    def _get_target_language_model_for_drafter_probe(self):
+        target_model = self.model_runner.model
+        try:
+            from vllm.model_executor.models.interfaces import supports_multimodal
+        except ImportError:
+            supports_multimodal = None
+
+        if supports_multimodal is not None and supports_multimodal(target_model):
+            return target_model.get_language_model()
+        return target_model
+
+    def inspect_drafter_sharing(self) -> dict:
+        """Report whether the vLLM drafter shares key tensors with the target."""
+        drafter = getattr(self.model_runner, "drafter", None)
+        drafter_model = getattr(drafter, "model", None) if drafter is not None else None
+        if drafter_model is None:
+            return {"ok": False, "reason": "no drafter / drafter has no .model", "rank": getattr(self, "rank", None)}
+
+        target_model = self._get_target_language_model_for_drafter_probe()
+        target_inner = getattr(target_model, "model", None)
+        target_embed = None
+        if target_inner is not None:
+            target_embed = getattr(target_inner, "embed_tokens", None) or getattr(target_inner, "embedding", None)
+        target_lm_head = getattr(target_model, "lm_head", None)
+
+        drafter_inner = getattr(drafter_model, "model", None)
+        drafter_embed = getattr(drafter_inner, "embed_tokens", None) if drafter_inner is not None else None
+        drafter_lm_head = getattr(drafter_model, "lm_head", None)
+
+        def _ptr(module):
+            weight = getattr(module, "weight", None) if module is not None else None
+            return None if weight is None else weight.data_ptr()
+
+        return {
+            "ok": True,
+            "rank": getattr(self, "rank", None),
+            "drafter_class": type(drafter_model).__name__,
+            "has_own_embed_tokens": getattr(drafter_model, "has_own_embed_tokens", "N/A"),
+            "has_own_lm_head": getattr(drafter_model, "has_own_lm_head", "N/A"),
+            "embed_module_is_same": drafter_embed is target_embed,
+            "embed_weight_ptr_equal": _ptr(drafter_embed) is not None and _ptr(drafter_embed) == _ptr(target_embed),
+            "lm_head_module_is_same": drafter_lm_head is target_lm_head,
+            "lm_head_weight_ptr_equal": _ptr(drafter_lm_head) is not None and _ptr(drafter_lm_head) == _ptr(target_lm_head),
+            "drafter_embed_shape": tuple(drafter_embed.weight.shape) if drafter_embed is not None else None,
+            "target_embed_shape": tuple(target_embed.weight.shape) if target_embed is not None else None,
+            "drafter_lm_head_shape": tuple(drafter_lm_head.weight.shape) if drafter_lm_head is not None else None,
+            "target_lm_head_shape": tuple(target_lm_head.weight.shape) if target_lm_head is not None else None,
+        }
+
+    def probe_target_param_norms(self) -> dict:
+        """Return L2 norms of target embed/lm_head weights."""
+        target_model = self._get_target_language_model_for_drafter_probe()
+        target_inner = getattr(target_model, "model", None)
+        embed = getattr(target_inner, "embed_tokens", None) if target_inner is not None else None
+        lm_head = getattr(target_model, "lm_head", None)
+
+        def _norm(module):
+            weight = getattr(module, "weight", None) if module is not None else None
+            if weight is None:
+                return None
+            return float(weight.detach().float().norm().item())
+
+        return {
+            "rank": getattr(self, "rank", None),
+            "target_embed_norm": _norm(embed),
+            "target_lm_head_norm": _norm(lm_head),
+        }
+
+    def get_drafter_weights(self) -> dict:
+        """Export drafter weights to CPU for the verl-native smoke test."""
+        drafter = getattr(self.model_runner, "drafter", None)
+        drafter_model = getattr(drafter, "model", None) if drafter is not None else None
+        if drafter_model is None:
+            return {"ok": False, "reason": "no drafter / drafter has no .model", "rank": getattr(self, "rank", None)}
+
+        weights = [(name, tensor.detach().cpu().clone()) for name, tensor in drafter_model.state_dict().items()]
+        return {"ok": True, "rank": getattr(self, "rank", None), "weights": weights}
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
@@ -292,7 +420,26 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
 
         return super().__new__(cls)
 
-    def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
+    def _collect_shared_drafter_param_names(self, drafter_model) -> set[str]:
+        """Names of drafter params whose storage is the main model's."""
+        main_ptrs = {
+            p.data_ptr()
+            for p in self.model_runner.model.parameters()
+            if p.is_floating_point()
+        }
+        return {
+            name
+            for name, p in drafter_model.named_parameters()
+            if p.is_floating_point() and p.data_ptr() in main_ptrs
+        }
+
+    def update_weights_from_ipc(
+        self,
+        peft_config: dict = None,
+        base_sync_done=False,
+        use_shm: bool = False,
+        target_model: str = "main",
+    ):
         """Update the weights of the rollout model."""
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
@@ -307,13 +454,30 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             device=self.device,
             use_shm=use_shm,
         )
+        shared_names: set[str] = set()
+        if target_model == "drafter":
+            drafter = getattr(self.model_runner, "drafter", None)
+            if drafter is not None and getattr(drafter, "model", None) is not None:
+                shared_names = self._collect_shared_drafter_param_names(drafter.model)
+
         receiver.receive_weights(
             on_bucket_received=lambda weights: self._update_weights(
-                weights, peft_config=peft_config, base_sync_done=base_sync_done
+                weights,
+                peft_config=peft_config,
+                base_sync_done=base_sync_done,
+                target_model=target_model,
+                shared_names=shared_names,
             )
         )
 
-    def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
+    def _update_weights(
+        self,
+        weights: list[tuple[str, torch.Tensor]],
+        peft_config: dict,
+        base_sync_done: bool,
+        target_model: str = "main",
+        shared_names: set[str] | None = None,
+    ):
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = OmniTensorLoRARequest(
@@ -325,9 +489,96 @@ class vLLMOmniColocateWorkerExtension(_OmniWorkerBase):
             )
             self.add_lora(lora_request)
             logger.info(f"vLLM-Omni load weights, loaded_params: {len(weights)}")
+        elif target_model == "drafter":
+            drafter = getattr(self.model_runner, "drafter", None)
+            if drafter is None or getattr(drafter, "model", None) is None:
+                logger.debug("drafter weight update skipped (no drafter on this rank)")
+                return
+            if shared_names:
+                weights = [(name, weight) for name, weight in weights if name not in shared_names]
+            drafter.model.load_weights(weights)
+            logger.info(f"vLLM-Omni drafter load weights, loaded_params: {len(weights)}")
         else:
             logger.info("Loading standard weights (async)")
             self.load_weights(weights)
+
+    def _get_target_language_model_for_drafter_probe(self):
+        target_model = self.model_runner.model
+        try:
+            from vllm.model_executor.models.interfaces import supports_multimodal
+        except ImportError:
+            supports_multimodal = None
+
+        if supports_multimodal is not None and supports_multimodal(target_model):
+            return target_model.get_language_model()
+        return target_model
+
+    def inspect_drafter_sharing(self) -> dict:
+        """Report whether the vLLM drafter shares key tensors with the target."""
+        drafter = getattr(self.model_runner, "drafter", None)
+        drafter_model = getattr(drafter, "model", None) if drafter is not None else None
+        if drafter_model is None:
+            return {"ok": False, "reason": "no drafter / drafter has no .model", "rank": getattr(self, "rank", None)}
+
+        target_model = self._get_target_language_model_for_drafter_probe()
+        target_inner = getattr(target_model, "model", None)
+        target_embed = None
+        if target_inner is not None:
+            target_embed = getattr(target_inner, "embed_tokens", None) or getattr(target_inner, "embedding", None)
+        target_lm_head = getattr(target_model, "lm_head", None)
+
+        drafter_inner = getattr(drafter_model, "model", None)
+        drafter_embed = getattr(drafter_inner, "embed_tokens", None) if drafter_inner is not None else None
+        drafter_lm_head = getattr(drafter_model, "lm_head", None)
+
+        def _ptr(module):
+            weight = getattr(module, "weight", None) if module is not None else None
+            return None if weight is None else weight.data_ptr()
+
+        return {
+            "ok": True,
+            "rank": getattr(self, "rank", None),
+            "drafter_class": type(drafter_model).__name__,
+            "has_own_embed_tokens": getattr(drafter_model, "has_own_embed_tokens", "N/A"),
+            "has_own_lm_head": getattr(drafter_model, "has_own_lm_head", "N/A"),
+            "embed_module_is_same": drafter_embed is target_embed,
+            "embed_weight_ptr_equal": _ptr(drafter_embed) is not None and _ptr(drafter_embed) == _ptr(target_embed),
+            "lm_head_module_is_same": drafter_lm_head is target_lm_head,
+            "lm_head_weight_ptr_equal": _ptr(drafter_lm_head) is not None and _ptr(drafter_lm_head) == _ptr(target_lm_head),
+            "drafter_embed_shape": tuple(drafter_embed.weight.shape) if drafter_embed is not None else None,
+            "target_embed_shape": tuple(target_embed.weight.shape) if target_embed is not None else None,
+            "drafter_lm_head_shape": tuple(drafter_lm_head.weight.shape) if drafter_lm_head is not None else None,
+            "target_lm_head_shape": tuple(target_lm_head.weight.shape) if target_lm_head is not None else None,
+        }
+
+    def probe_target_param_norms(self) -> dict:
+        """Return L2 norms of target embed/lm_head weights."""
+        target_model = self._get_target_language_model_for_drafter_probe()
+        target_inner = getattr(target_model, "model", None)
+        embed = getattr(target_inner, "embed_tokens", None) if target_inner is not None else None
+        lm_head = getattr(target_model, "lm_head", None)
+
+        def _norm(module):
+            weight = getattr(module, "weight", None) if module is not None else None
+            if weight is None:
+                return None
+            return float(weight.detach().float().norm().item())
+
+        return {
+            "rank": getattr(self, "rank", None),
+            "target_embed_norm": _norm(embed),
+            "target_lm_head_norm": _norm(lm_head),
+        }
+
+    def get_drafter_weights(self) -> dict:
+        """Export drafter weights to CPU for the verl-native smoke test."""
+        drafter = getattr(self.model_runner, "drafter", None)
+        drafter_model = getattr(drafter, "model", None) if drafter is not None else None
+        if drafter_model is None:
+            return {"ok": False, "reason": "no drafter / drafter has no .model", "rank": getattr(self, "rank", None)}
+
+        weights = [(name, tensor.detach().cpu().clone()) for name, tensor in drafter_model.state_dict().items()]
+        return {"ok": True, "rank": getattr(self, "rank", None), "weights": weights}
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication."""
