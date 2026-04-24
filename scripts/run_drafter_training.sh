@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Drafter training smoke — close-loop rollout -> HS -> update_drafter (real
 # forward/backward/optimizer.step). Target model frozen. Success criteria:
-# train/loss_weighted decreases, train/simulated_acc_len increases over N steps.
+# train/loss_weighted decreases, train/simulated_acc_len increases.
 #
 # Override any knob with KEY=VALUE env vars, e.g.:
-#   MAX_STEPS=32 BATCH_SIZE=8 ./scripts/run_drafter_training.sh
+#   NUM_SAMPLES=500 NUM_EPOCHS=3 BATCH_SIZE=8 ./scripts/run_drafter_training.sh
 # Extra Hydra overrides flow through "$@":
 #   ./scripts/run_drafter_training.sh actor_rollout_ref.drafter.optimizer_config.lr=1e-4
 
@@ -16,7 +16,7 @@ RECIPE_DIR="$VERL_ROOT/recipe/drafter_cotraining"
 
 # ── Defaults (override with env vars) ─────────────────────────────────
 VENV_DIR="${VENV_DIR:-$VERL_ROOT/.venv}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-4B}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-8B}"
 TRAIN_FILE="${TRAIN_FILE:-$HOME/data/gsm8k/train.parquet}"
 VAL_FILE="${VAL_FILE:-$HOME/data/gsm8k/test.parquet}"
 
@@ -38,19 +38,41 @@ AUX_LAYER_IDS="${AUX_LAYER_IDS:-[2,18,33,35]}"
 
 BATCH_SIZE="${BATCH_SIZE:-8}"          # must be multiple of rollout.agent.num_workers
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-256}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-128}"
-ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-512}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-512}"
+# rollout.max_model_len must hold (prompt + response). The HS collector
+# re-sends (prompt + response) as a prefill-only prompt with max_tokens=1;
+# vLLM clamps max_tokens to (max_model_len - len(prompt_ids)), so
+# HS_MAX_MODEL_LEN must be STRICTLY greater than prompt+response — a sample
+# that fills the full window triggers VLLMValidationError("max_tokens must
+# be at least 1, got 0"). 32-token slack is plenty.
+HS_MODEL_LEN_SLACK="${HS_MODEL_LEN_SLACK:-32}"
+ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESPONSE_LEN + HS_MODEL_LEN_SLACK))}"
 HS_MAX_MODEL_LEN="${HS_MAX_MODEL_LEN:-$ROLLOUT_MAX_MODEL_LEN}"
 GPU_MEM="${GPU_MEM:-0.5}"
 N_GPUS="${N_GPUS:-2}"
 
-# MAX_STEPS also drives the cosine LR schedule — see §4.7 of the milestone
-# plan. Keep >= 16 for a visible loss/acc_len trend.
-MAX_STEPS="${MAX_STEPS:-1000}"
+# Dataset / schedule — smoke iterates NUM_EPOCHS over the first NUM_SAMPLES
+# of the training parquet. Total optimizer steps drive the cosine LR
+# schedule (see §4.7 of the milestone plan).
+NUM_SAMPLES="${NUM_SAMPLES:-1000}"
+NUM_EPOCHS="${NUM_EPOCHS:-5}"
+STEPS_PER_EPOCH=$(( (NUM_SAMPLES + BATCH_SIZE - 1) / BATCH_SIZE ))
+TOTAL_STEPS=$(( STEPS_PER_EPOCH * NUM_EPOCHS ))
 
 DRAFTER_LR="${DRAFTER_LR:-1.0e-4}"
 DRAFTER_WARMUP_RATIO="${DRAFTER_WARMUP_RATIO:-0.015}"
 DRAFTER_CLIP_GRAD="${DRAFTER_CLIP_GRAD:-0.5}"
+
+# Checkpoint output — drafter weights land under
+#   $CKPT_DIR/global_step_{TOTAL_STEPS}/drafter/
+#     ├── model_world_size_*_rank_*.pt   (sharded FSDP, every rank)
+#     └── huggingface/
+#         ├── config.json                (HF LlamaConfig, rank 0)
+#         └── model.safetensors          (draft-model weights, rank 0)
+# Load back via AutoEagle3DraftModel.from_pretrained(".../huggingface").
+# Set SAVE_AT_END=False to skip the final save (faster dry runs).
+CKPT_DIR="${CKPT_DIR:-$VERL_ROOT/checkpoints/drafter_training_smoke/training_smoke}"
+SAVE_AT_END="${SAVE_AT_END:-True}"
 
 # ── Sanity ────────────────────────────────────────────────────────────
 if [ ! -d "$VENV_DIR" ]; then
@@ -90,6 +112,7 @@ python "$RECIPE_DIR/scripts/test_drafter_training.py" \
     data.val_files="['$VAL_FILE']" \
     data.train_batch_size="$BATCH_SIZE" \
     data.val_batch_size="$BATCH_SIZE" \
+    data.train_max_samples="$NUM_SAMPLES" \
     data.max_prompt_length="$MAX_PROMPT_LEN" \
     data.max_response_length="$MAX_RESPONSE_LEN" \
     actor_rollout_ref.model.path="$MODEL_PATH" \
@@ -112,7 +135,7 @@ python "$RECIPE_DIR/scripts/test_drafter_training.py" \
     actor_rollout_ref.drafter.optimizer_config.lr="$DRAFTER_LR" \
     actor_rollout_ref.drafter.optimizer_config.lr_warmup_steps_ratio="$DRAFTER_WARMUP_RATIO" \
     actor_rollout_ref.drafter.optimizer_config.clip_grad="$DRAFTER_CLIP_GRAD" \
-    actor_rollout_ref.drafter.optimizer_config.total_training_steps="$MAX_STEPS" \
+    actor_rollout_ref.drafter.optimizer_config.total_training_steps="$TOTAL_STEPS" \
     hs_collector.inference.max_model_len="$HS_MAX_MODEL_LEN" \
     hs_collector.inference.engine_kwargs.vllm.speculative_config.draft_model_config.hf_config.eagle_aux_hidden_state_layer_ids="$AUX_LAYER_IDS" \
     algorithm.adv_estimator=grpo \
@@ -120,12 +143,21 @@ python "$RECIPE_DIR/scripts/test_drafter_training.py" \
     trainer.logger='["console"]' \
     trainer.project_name=drafter_training_smoke \
     trainer.experiment_name=training_smoke \
+    trainer.default_local_dir="$CKPT_DIR" \
     trainer.n_gpus_per_node="$N_GPUS" \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
-    trainer.total_training_steps="$MAX_STEPS" \
+    trainer.total_epochs="$NUM_EPOCHS" \
+    trainer.total_training_steps="$TOTAL_STEPS" \
     trainer.val_before_train=False \
-    +micro.max_steps="$MAX_STEPS" \
+    +micro.save_at_end="$SAVE_AT_END" \
     "$@"
+
+if [ "$SAVE_AT_END" = "True" ]; then
+    echo
+    echo "──────────────────────────────────────────────────────────────────"
+    echo "  Drafter checkpoint:  $CKPT_DIR/global_step_${TOTAL_STEPS}/drafter"
+    echo "  HF export:           $CKPT_DIR/global_step_${TOTAL_STEPS}/drafter/huggingface"
+    echo "──────────────────────────────────────────────────────────────────"
+fi
