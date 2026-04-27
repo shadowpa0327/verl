@@ -36,7 +36,7 @@ raw prompt → rollout → hidden states (Mooncake) → mesh dispatch
 
 | Component | File |
 |---|---|
-| Drafter worker | `fsdp_workers.py` (`ActorRolloutRefDrafterWorker`) |
+| Drafter worker | `engine_workers.py` (`ActorRolloutRefDrafterWorker`) |
 | Drafter engine | `drafter_engine.py` (`FSDPDrafterEngine`, `DrafterModelConfig`) |
 | Trainer + entry point | `ray_trainer.py`, `main_drafter_ct.py` |
 | Data controller | `controller.py` (`DrafterDataController`, `SampleMeta`) |
@@ -75,10 +75,41 @@ Per-step wall-clock ~2.6s (gen 1.0s + HS 1.0s + drafter train 0.65s).
 
 Defaults match TorchSpec's Eagle3 training: `lr=1e-4`,
 `weight_decay=0`, `lr_warmup_steps_ratio=0.015`, `lr_scheduler_type=cosine`,
-`clip_grad=0.5`, `accumulation_steps=1`, FSDP1 + `use_orig_params=True`.
-vLLM aux layer IDs default to `[2,18,33,35]` (TorchSpec post-layer +1
-shift + final-layer append for Qwen3-4B 36 layers). Loss mask is
-response-only with the final response position dropped.
+`clip_grad=0.5`. **Engine: FSDP2 with TorchSpec-style selective wrap**
+(only `LlamaDecoderLayer` gets its own FSDP unit; `lm_head` / `norm`
+/ `fc` / `embed_tokens` stay in the root unit and remain gathered
+through backward). vLLM aux layer IDs default to `[2,18,33,35]`
+(TorchSpec post-layer +1 shift + final-layer append for Qwen3-4B 36
+layers). Loss mask is response-only with the final response position
+dropped.
+
+---
+
+## FSDP2 + micro-batching refactor (2026-04-26)
+
+Three-phase refactor; design + rationale in
+`claude_docs/research/Eagle3-Co-Trained/Drafter Micro-Batching {Refactor,Concrete} Plan.md`.
+
+| Phase | Change | Files |
+|---|---|---|
+| **A — Kernel fix** | Drop `LazyTarget` + `compiled_forward_kl_loss_from_hs`; generalize `compute_target_p_padded` to support `t2d=None` (no-pruning); store `target_p` as bf16. | `eagle3/eagle3_model.py`, `eagle3/ops/loss.py`, `drafter_engine.py::prepare_model_inputs`, `tests/test_eagle3_loss.py` |
+| **B — FSDP2 wrap** | Override `FSDPDrafterEngine._build_fsdp_module` for selective wrap (only `LlamaDecoderLayer`). Yaml: `strategy: fsdp → fsdp2`, drop `use_orig_params`. | `drafter_engine.py`, both yaml configs |
+| **C — Micro-batching** | Paged Mooncake fetch + per-mb weighted backward; metadata-time empty-mask filter; `total_valid_global` preflight; `T_pad_macro` precompute; `set_requires_gradient_sync(is_last)` on FSDP2 root. New helpers: `_allreduce_sum_int`, `_select_data_indices`, `_iter_micro_batch_keys`, `_drafter_train_step_micro`, `_drafter_micro_step`, `_aggregate_micro_metrics`. New `Eagle3Collator(features, bucket_size_override=...)`. New yaml `drafter.engine_config.micro_batch_size_per_gpu` (default 1). | `engine_workers.py`, `eagle3_collator.py`, both yaml configs |
+| **E — Rename** | `recipe/drafter_cotraining/fsdp_workers.py` → `engine_workers.py` (engine-agnostic pattern; FSDP-naming was misleading). | recipe + claude_docs |
+
+**Verification command** (Qwen3-8B pretrain — actively developed path):
+
+```bash
+DATA_DIR=/root/verl/data/qwen3_8b_eagle3_ultrachat \
+  ./recipe/drafter_cotraining/scripts/run_qwen3_8b_eagle3_pretrain.sh \
+  trainer.total_training_steps=16
+```
+
+Two-axis verification:
+- `micro_batch_size_per_gpu` = `data.train_batch_size / world_size` (single-shot equivalence; bitwise match against pre-refactor baseline).
+- `micro_batch_size_per_gpu=1` (full N-way accumulation; should match within `~1e-3` float-noise band).
+
+**Checkpoint break:** FSDP1 sharded checkpoints (FlatParameter layout) are not loadable by FSDP2 (DTensor layout). Smoke runs do not require resume — start fresh.
 
 ---
 
@@ -86,7 +117,7 @@ response-only with the final response position dropped.
 
 ### TODO 4 — Drafter → rollout weight sync (not a blocker)
 
-`recipe/drafter_cotraining/fsdp_workers.py::update_weights` currently
+`recipe/drafter_cotraining/engine_workers.py::update_weights` currently
 has a `pass` placeholder. `engine.get_per_tensor_param()` already
 returns drafter weights; the rollout side needs an
 `update_drafter_weights()` API to receive them. Required only for

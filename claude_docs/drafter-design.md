@@ -172,65 +172,101 @@ this.
 
 ## Drafter training step
 
-`update_drafter` in `recipe/drafter_cotraining/fsdp_workers.py`:
+`update_drafter` in `recipe/drafter_cotraining/engine_workers.py` runs
+a paged-Mooncake-fetch + micro-batch accumulation loop (mirrors verl's
+canonical `forward_backward_batch` divisor pattern):
 
-1. **Fetch** — `EagleMooncakeStore.get(key, shapes, dtypes, device)`
-   per sample.
-2. **Mask** — `loss_mask = [0]*prompt_len + [1]*(response_len-1) + [0]`
-   per sample. Drops the final response position (no valid next-token
-   target — matches TorchSpec `sgl_engine_decode.py:249`
-   `completion_tokens-1`).
-3. **Collate** — `Eagle3Collator` pads to `[B, T_pad]` / `[B, T_pad, D]`,
-   `T_pad` = ceil to next multiple of 256.
-4. **Prepare model inputs** — `FSDPDrafterEngine.prepare_model_inputs`
-   left-shifts `input_ids` and `last_hidden_states` by 1
-   (`padding(..., left=False)`), applies `verifier_norm` to
-   `last_hidden_states`, builds a `LazyTarget` from
-   `target_lm_head_weight`. Left-shift matches Eagle3 inference
-   semantics: at TTT step 0 / position t, draft sees
-   `(aux[t], token[t+1])` and predicts `token[t+2]`.
-5. **Forward** — `Eagle3Model.forward(input_ids, attention_mask, target,
-   loss_mask, hidden_states)` — 7-step TTT loop, returns
-   `(plosses[L], _, acces[L])`.
-6. **Backward** — `loss = sum(0.8^i * plosses[i] for i in range(L)) /
-   accumulation_steps`; `loss.backward()`.
-7. **Optimizer step** — `engine.optimizer_step()` (clips grad to
-   `clip_grad`, skips on non-finite); `engine.lr_scheduler_step()`.
-8. **Aggregate metrics** — `_aggregate_drafter_metrics` all-reduces
-   per-TTT-step plosses + acces over the DP group, computes
-   `simulated_acc_len = acc_0 + acc_0·acc_1 + …`, returns dict in
-   `meta_info["train_metrics"]`.
-9. **Cleanup** — `EagleMooncakeStore.remove_eagle3_tensors(key)` per
-   sample (frees the buffer for the next prefill).
+1. **Empty-mask filter (metadata)** — drop samples with `rlen-1 <= 0`
+   before any tensor fetch; eagerly free their Mooncake keys. Mirrors
+   TorchSpec `data_fetcher.py:177`.
+2. **Preflight `total_valid_global`** — sum `max(0, rlen-1)` across
+   surviving samples and all-reduce SUM across the DP group. This is
+   the divisor for the exact-mean per-micro-batch loss scaling.
+3. **`T_pad_macro` precompute** — `max(prompt_lens + response_lens)`
+   across all surviving samples on this rank; passed into the collator
+   per micro-batch so all micro-batches share identical `T_pad`. This
+   prevents `torch.compile` recompilation across micro-batches.
+4. **`engine.train_mode` (one context for the whole macro-step)** —
+   for each micro-batch:
+   1. **Grad-sync suppression** — `set_requires_gradient_sync(is_last)`
+      on the FSDP2 root suppresses inter-rank reduce-scatter on
+      all-but-last micro-batch (mirrors TorchSpec's pattern; on FSDP1
+      this attribute is missing → no-op via `getattr` guard).
+   2. **Paged Mooncake fetch** — `_fetch_drafter_batch_from_mooncake`
+      pulls just this micro-batch's keys, builds the response-only
+      `loss_mask = [0]*plen + [1]*(rlen-1) + [0]` per sample, calls
+      `Eagle3Collator(features, bucket_size_override=T_pad_macro)`,
+      then `EagleMooncakeStore.remove_eagle3_tensors(key)` per key
+      (eager cleanup).
+   3. **Prepare** — `FSDPDrafterEngine.prepare_model_inputs`
+      left-shifts `input_ids` + `last_hidden_states`, applies
+      `verifier_norm`, builds a `PrecomputedTarget` (bf16-stored
+      `target_p`; supports `t2d=None` no-pruning case via
+      `compute_target_p_padded`).
+   4. **Forward** — `Eagle3Model.forward(...)` runs the 7-step TTT
+      loop and returns `(plosses[L], _, acces[L])`.
+   5. **Weighted backward** — local `mb_valid` = `loss_mask.sum()`
+      (or `position_mask.sum()` if pruning); scale =
+      `mb_valid / total_valid_global`; backward
+      `Σ_i 0.8^i · plosses[i] · scale`. Skip backward for
+      `mb_valid == 0` (in-kernel zero-grad fallback already touches
+      every param so reduce-scatter on the LAST mb still works).
+5. **Optimizer step** — re-enable grad sync defensively, then
+   `engine.optimizer_step()` (clips grad to `clip_grad`, skips on
+   non-finite); `engine.lr_scheduler_step()`. Both inside the same
+   `train_mode` context so `train_mode.__exit__` zeros grads.
+6. **Aggregate metrics** — `_aggregate_micro_metrics` combines per-mb
+   `plosses`/`acces` (weighted by `mb_valid`) and reuses
+   `_aggregate_drafter_metrics` for the DP all-reduce + final dict.
+   Surfaces `train/accum_steps`, `train/macro_valid_global`,
+   `train/t_pad_macro` for verification.
 
-`accumulation_steps` is fixed at 1 today; multi-micro-batch
-accumulation is a small follow-up.
+`micro_batch_size_per_gpu` is configurable in
+`drafter.engine_config.micro_batch_size_per_gpu` (default 1). Setting
+it equal to `data.train_batch_size / world_size` recovers single-shot
+behavior (one optimizer step per macro-batch).
 
 ---
 
-## Engine choice — FSDP1 with `use_orig_params=True`
+## Engine choice — FSDP2 with selective wrap (TorchSpec-style)
 
-The drafter engine uses FSDP1 (`torch.distributed.fsdp.FullyShardedDataParallel`)
-with `use_orig_params=True` for two reasons:
+The drafter engine uses FSDP2 (`torch.distributed.fsdp.fully_shard`)
+with a selective wrap that mirrors TorchSpec's pattern: shard **only**
+`LlamaDecoderLayer` sub-units; let `lm_head`, `model.norm`, `fc`, and
+`embed_tokens` fall under the root `fully_shard` call. The override
+lives in `FSDPDrafterEngine._build_fsdp_module` (drafter_engine.py).
 
-1. **Mixed-grad compatibility.** Draft has frozen `embed_tokens` +
-   trainable `fc`/`midlayer`/`norm`/`lm_head`. FSDP1's default
-   `use_orig_params=False` rejects mixed `requires_grad` in a wrap
-   group. `True` lifts that restriction.
+**Why selective wrap (not verl's default `apply_fsdp2`):** verl's
+`_select_fsdp2_wrap_targets` (`fsdp_utils.py:510-531`) wraps
+`embed_tokens` and `lm_head` as their own FSDP units when
+`tie_word_embeddings=False` (Qwen3-8B). The Eagle3 loss kernel reads
+`lm_head.weight` as an extracted tensor (`F.linear(input, lm_head_w)`),
+not via `lm_head.forward()` — so the sub-unit's pre-forward hook never
+fires and the kernel sees a non-gathered DTensor.
 
-2. **Plain Tensor params.** FSDP2 (`fully_shard`) wraps params as
-   `DTensor`s. The Eagle3 loss kernel does
-   `F.linear(plain_input, draft_lm_head_weight)`; with FSDP2, that
-   becomes a mixed `Tensor × DTensor` matmul which PyTorch doesn't
-   auto-promote. FSDP1 with `use_orig_params=True` keeps params as
-   plain `nn.Parameter`, so the kernel runs eagerly without
-   `distribute_tensor` plumbing.
+**Why root keeps params gathered through backward:** PyTorch's
+`fully_shard` auto-detects the root unit and forces its effective
+`reshard_after_forward=False` regardless of what the caller passes
+(see `set_reshard_after_forward` docstring in
+`verl/utils/fsdp_utils.py:734-766`). So root-resident params
+(`lm_head`, `norm`, `fc`, `embed_tokens`) are gathered once at root
+forward entry and stay gathered through all 7 TTT steps + backward —
+exactly what the compiled kernel needs. Sub-units (`LlamaDecoderLayer`)
+default to `reshard_after_forward=True` for the actual memory saving.
 
-TorchSpec's analog is `torch.distributed._composable.replicate` (DDP
-with FSDP-style API, default for Eagle3 training in TorchSpec). Verl
-doesn't expose a `replicate`-style strategy today; FSDP1 is the
-closest. Sharding adds an all-gather per forward but the draft is tiny
-(<1 GB bf16) so the cost is negligible at our scale.
+**Why we dropped FSDP1 + `use_orig_params=True`:** FSDP1 worked but
+required `use_orig_params=True` to handle the mixed-grad
+(frozen embed + trainable rest) wrap. FSDP2 always behaves
+orig-params-like, so the flag is moot. The compile-graph stability
+issue with `lm_head.weight` (the original deterrent for FSDP2)
+disappears once we shard selectively per the override above.
+
+**Mirror of TorchSpec.** TorchSpec's `apply_fsdp2`
+(`ref/TorchSpec/torchspec/training/fsdp.py:137-200`) shards
+the individual `Linear` modules inside `midlayer`; we shard
+`LlamaDecoderLayer` (one unit per decoder block). For a one-block
+drafter the choice is just FSDP-unit granularity — equivalent
+behavior, simpler code.
 
 ---
 
@@ -245,7 +281,7 @@ on every rank at init:
 | `lm_head.weight` (`target_lm_head_weight`) | `lm_head.weight`, fallback `model.embed_tokens.weight` if `tie_word_embeddings=True` | `FSDPDrafterEngine._target_lm_head_weight` | `initialize` → `_load_target_frozen_weights` |
 | `model.norm.weight` (`verifier_norm`) | `model.norm.weight` | `FSDPDrafterEngine._verifier_norm` (a `LlamaRMSNorm` module) | `initialize` → `_load_target_frozen_weights` |
 
-This sidesteps the FSDP1-sharded actor params at the cost of needing
+This sidesteps the FSDP-sharded actor params at the cost of needing
 `target_model_path` set (defaults to `${actor_rollout_ref.model.path}`
 in the recipe YAML).
 
@@ -279,9 +315,10 @@ metrics live in commit messages on `feat/drafter-cotraining`.
 - **Actor → drafter frozen-module re-sync after `update_actor`** —
   `sync_frozen_modules_from_actor` is a no-op stub; needs FSDP-aware
   actor-param gather. Frozen-target smoke doesn't exercise this.
-- **Gradient accumulation > 1** — single-step path proven, multi-step
-  is a small extension to `_drafter_train_step`.
-- **Vocab pruning** (`draft_vocab_size < vocab_size` +
-  `set_vocab_buffers`) — `prepare_model_inputs` would gain a branch on
-  `eagle3.vocab_pruning` to use `compute_target_p_padded` instead of
-  `compute_lazy_target_padded`.
+- **Vocab pruning end-to-end** — `compute_target_p_padded` already
+  supports both the pruning (`t2d` set) and no-pruning (`t2d=None`)
+  paths post-Phase-A refactor. To activate: provide a `local_path` JSON
+  template setting `draft_vocab_size < vocab_size`, populate `t2d` on
+  the engine (`FSDPDrafterEngine._t2d_index`), and pass it through
+  `prepare_model_inputs`. The loss-kernel + position-mask paths stay
+  unchanged.

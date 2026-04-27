@@ -68,7 +68,7 @@ Concrete guidance:
 
 | Change kind | Where it goes |
 |---|---|
-| Drafter worker / engine logic | `recipe/drafter_cotraining/{fsdp_workers,drafter_engine}.py` |
+| Drafter worker / engine logic | `recipe/drafter_cotraining/{engine_workers,drafter_engine}.py` |
 | Eagle3 model / loss / draft | `recipe/drafter_cotraining/eagle3/...` |
 | Mooncake transfer / KV connector | `recipe/drafter_cotraining/mooncake/...` |
 | HS collector manager | `recipe/drafter_cotraining/hs_collector/...` |
@@ -272,3 +272,4 @@ Core principles: **Simplicity First** | **No Laziness** (root causes only) | **M
 - Use `tasks` to maintain todos.
 - No unanimity gate needed — controller pattern guarantees consensus by construction.
 - vLLM captures pre-norm last_hidden_states — `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` before target construction. The loss kernel's RMSNorm is for the draft model's own norm (separate concern).
+- Don't confused yourself with the legacy worker implementation. For instance (`verl/workers/actor/dp_actor.py`). This is supposed to be deprecated soonly 
