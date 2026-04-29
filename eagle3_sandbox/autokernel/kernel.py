@@ -56,6 +56,46 @@ KERNEL_NUM_WARPS = 16
 CHUNK_LOGITS_BYTES_BUDGET = 512 * 1024 * 1024
 
 
+# ─── Triton kernel: fused gather + RMSNorm forward ────────────────────────
+# Reads `prenorm_hs_flat[valid_idx[row], :]`, computes RMSNorm in fp32,
+# writes both `norm_hs` and `rstd` in one pass. Avoids the (N, H) fp32
+# intermediate that an eager RMSNorm + duplicate rstd path produces.
+@triton.jit
+def _gather_rmsnorm_fwd_kernel(
+    PRENORM_HS_ptr,    # (B*T, H) bf16/fp16
+    VALID_IDX_ptr,     # (N,)     int64
+    NORM_W_ptr,        # (H,)     bf16/fp16
+    HS_ptr,            # (N, H)   bf16/fp16  output (gathered hs, saved for bwd)
+    NORM_HS_ptr,       # (N, H)   bf16/fp16  output (RMSNormed)
+    RSTD_ptr,          # (N,)     fp32       output
+    eps,
+    H_const: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H_const
+
+    real_row = tl.load(VALID_IDX_ptr + row)
+    hs = tl.load(PRENORM_HS_ptr + real_row * H_const + offs, mask=mask, other=0.0)
+    hs_f32 = hs.to(tl.float32)
+
+    # rstd = 1 / sqrt(mean(hs^2) + eps)
+    sum_sq = tl.sum(hs_f32 * hs_f32, axis=0)
+    mean_sq = sum_sq / H_const
+    rstd = 1.0 / tl.sqrt(mean_sq + eps)
+
+    norm_w = tl.load(NORM_W_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    # F.rms_norm computes: (hs * rstd) * norm_w in fp32 then casts.
+    norm_hs = hs_f32 * rstd * norm_w
+
+    # Save the gathered hs (so bwd doesn't re-gather), the normed output,
+    # and the per-row rstd.
+    tl.store(HS_ptr + row * H_const + offs, hs, mask=mask)
+    tl.store(NORM_HS_ptr + row * H_const + offs, norm_hs, mask=mask)
+    tl.store(RSTD_ptr + row, rstd)
+
+
 # ─── Triton kernel: in-place scalar scaling for backward grad ────────────
 @triton.jit
 def _scale_inplace_kernel(X_ptr, scalar_ptr, n_elems, BLOCK_SIZE: tl.constexpr):
@@ -65,6 +105,57 @@ def _scale_inplace_kernel(X_ptr, scalar_ptr, n_elems, BLOCK_SIZE: tl.constexpr):
     x = tl.load(X_ptr + offs, mask=mask).to(tl.float32)
     s = tl.load(scalar_ptr).to(tl.float32)
     tl.store(X_ptr + offs, x * s, mask=mask)
+
+
+# ─── Triton kernel: RMSNorm backward + scatter to grad_prenorm_hs_flat ────
+# One program per gathered row. Computes:
+#   - g  = grad_norm_hs * d_loss        (rescaled in-place into GRAD_NORM_HS_ptr)
+#   - z  = hs * rstd                    (re-derived; no fp32 intermediate saved)
+#   - h  = g * norm_w
+#   - A  = mean_j(h_j * z_j)
+#   - grad_hs = rstd * (h - z * A)      (RMSNorm bwd formula)
+#   - scatter grad_hs into grad_prenorm_hs_flat[valid_idx[row]]
+#   - atomic_add per-row contribution (g * z) into grad_norm_weight
+# Single kernel replaces IndexSelectBackward + FusedRmsNormBackward + the
+# separate d_loss mul on grad_norm_hs.
+@triton.jit
+def _rms_norm_bwd_scatter_kernel(
+    GRAD_NORM_HS_ptr,         # (N, H)   bf16/fp16, written-back scaled by d_loss
+    HS_ptr,                   # (N, H)   bf16/fp16
+    RSTD_ptr,                 # (N,)     fp32
+    NORM_W_ptr,               # (H,)     bf16/fp16
+    VALID_IDX_ptr,            # (N,)     int64
+    GRAD_PRENORM_HS_ptr,      # (B*T, H) bf16/fp16, must be pre-zeroed
+    GRAD_NORM_W_ptr,          # (H,)     fp32, must be pre-zeroed (atomic target)
+    D_LOSS_ptr,               # ()       fp32 scalar
+    H_const: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H_const
+
+    g_raw = tl.load(GRAD_NORM_HS_ptr + row * H_const + offs, mask=mask).to(tl.float32)
+    hs = tl.load(HS_ptr + row * H_const + offs, mask=mask).to(tl.float32)
+    rstd = tl.load(RSTD_ptr + row).to(tl.float32)
+    norm_w = tl.load(NORM_W_ptr + offs, mask=mask).to(tl.float32)
+    d_loss = tl.load(D_LOSS_ptr).to(tl.float32)
+
+    g = g_raw * d_loss
+    z = hs * rstd
+    h = g * norm_w
+    A = tl.sum(h * z, axis=0) / H_const
+
+    grad_hs = rstd * (h - z * A)
+
+    # Scatter grad_hs into grad_prenorm_hs_flat at the valid_idx row.
+    real_row = tl.load(VALID_IDX_ptr + row)
+    tl.store(GRAD_PRENORM_HS_ptr + real_row * H_const + offs, grad_hs, mask=mask)
+
+    # atomic_add per-row contribution into grad_norm_weight (fp32). Per-slot
+    # contention is bounded by N rows but distributes across H slots, and
+    # atomic_add on fp32 is hardware-accelerated on Ampere.
+    tl.atomic_add(GRAD_NORM_W_ptr + offs, g * z, mask=mask)
 
 
 # ─── Triton kernel: per-row online softmax + KL loss + in-place d_logits ──
@@ -152,36 +243,44 @@ def _eagle3_kl_loss_kernel(
     tl.store(loss_ptr + row, -row_loss)
 
 
-# ─── Custom autograd.Function: chunked matmul + Triton loss + saved grads ─
-class _Eagle3LossFn(torch.autograd.Function):
-    """Mirrors LigerFusedLinearJSDFunction (fused_linear_jsd.py) but with:
-        - target_p in probability space (not log-space)  → d_logits = softmax - tp
-        - inline argmax-equality accuracy
-        - returns (loss, acc) tuple instead of single loss
-        - no temperature scaling
-    """
-
+# ─── Custom autograd.Function: full pipeline ──────────────────────────────
+# Owns gather + RMSNorm + chunked matmul + Triton loss + grad precompute.
+# Backward uses a custom RMSNorm-bwd-with-scatter kernel that writes
+# directly into grad_prenorm_hs_flat at valid_idx rows -- eliminating both
+# IndexSelectBackward (~250us at large) and FusedRmsNormBackward (~180us
+# at large) from the autograd graph.
+class _Eagle3FullFn(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        norm_hs: torch.Tensor,
-        target_p_flat: torch.Tensor,
-        lm_head_w: torch.Tensor,
-        valid_idx: torch.Tensor,
+        prenorm_hs_flat: torch.Tensor,    # (B*T, H)  bf16/fp16
+        target_p_flat: torch.Tensor,      # (B*T, V)  bf16/fp16  (no grad)
+        lm_head_w: torch.Tensor,          # (V, H)    bf16/fp16
+        valid_idx: torch.Tensor,          # (N,)      int64
+        norm_weight: torch.Tensor,        # (H,)      bf16/fp16
+        norm_eps: float,
     ):
-        """
-        Args:
-            norm_hs        (N, H)     bf16/fp16 -- post-RMSNorm draft hs
-            target_p_flat  (B*T, V)   bf16/fp16 -- ungathered target probs
-            lm_head_w      (V, H)     bf16/fp16 -- draft lm_head weight
-            valid_idx      (N,)       int64     -- row indices into target_p_flat
-        Returns:
-            loss (scalar fp32), acc (scalar fp32)
-        """
-        device = norm_hs.device
-        dtype = norm_hs.dtype
-        N, H = norm_hs.shape
+        device = prenorm_hs_flat.device
+        dtype = prenorm_hs_flat.dtype
+        BT, H = prenorm_hs_flat.shape
+        N = valid_idx.shape[0]
         V, _ = lm_head_w.shape
+
+        # ── 1+2. Fused gather + RMSNorm in one Triton kernel ────────────
+        # Reads prenorm_hs at valid_idx, computes rstd, writes hs/norm_hs/rstd
+        # in a single pass. Avoids the (N, H) fp32 intermediate that a
+        # non-fused gather + RMSNorm path produces, and saves the duplicate
+        # rstd reduction the eager F.rms_norm call would force.
+        hs = torch.empty((N, H), dtype=dtype, device=device)
+        norm_hs = torch.empty((N, H), dtype=dtype, device=device)
+        rstd = torch.empty(N, dtype=torch.float32, device=device)
+        BLOCK_H_FWD = triton.next_power_of_2(H)
+        _gather_rmsnorm_fwd_kernel[(N,)](
+            prenorm_hs_flat, valid_idx, norm_weight,
+            hs, norm_hs, rstd, norm_eps,
+            H_const=H, BLOCK_H=BLOCK_H_FWD,
+            num_warps=8,
+        )
 
         # ── Chunking schedule (memory-budget pattern) ───────────────────
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
@@ -265,25 +364,46 @@ class _Eagle3LossFn(torch.autograd.Function):
         loss = loss_per_row.sum() / max(1, N)
         acc = correct_per_row.mean()
 
-        # ── Save ONLY pre-computed grads (Liger pattern) ───────────────
-        ctx.save_for_backward(grad_norm_hs, grad_lm_head)
+        # ── Save for backward ──────────────────────────────────────────
+        ctx.save_for_backward(hs, rstd, norm_weight, valid_idx, grad_norm_hs, grad_lm_head)
+        ctx.prenorm_shape = prenorm_hs_flat.shape
+        ctx.dtype = dtype
         return loss, acc
 
     @staticmethod
     def backward(ctx, d_loss: torch.Tensor, d_acc: torch.Tensor):
-        """Backward = scale saved grads by d_loss in-place. d_acc is unused
-        (argmax is non-differentiable). target_p_flat and valid_idx have no
-        grads. The in-place mul avoids allocating (N, H) and (V, H) temporaries
-        -- the latter is 1.2 GB at prod."""
-        grad_norm_hs, grad_lm_head = ctx.saved_tensors
-        # Custom Triton scale-in-place for the large (V, H) buffer; aten's
-        # vectorized_elementwise_kernel runs at ~65% of peak BW on bf16 muls.
+        hs, rstd, norm_weight, valid_idx, grad_norm_hs, grad_lm_head = ctx.saved_tensors
+        BT_H_shape = ctx.prenorm_shape
+        dtype = ctx.dtype
+        N, H = grad_norm_hs.shape
+
+        # ── Scale grad_lm_head by d_loss in-place via Triton ────────────
         n_elems = grad_lm_head.numel()
         BLOCK = 4096
         grid = (triton.cdiv(n_elems, BLOCK),)
         _scale_inplace_kernel[grid](grad_lm_head, d_loss, n_elems, BLOCK_SIZE=BLOCK, num_warps=4)
-        grad_norm_hs.mul_(d_loss)
-        return grad_norm_hs, None, grad_lm_head, None
+
+        # ── RMSNorm bwd + scatter to grad_prenorm_hs in one custom kernel.
+        #    Also folds the d_loss scaling on grad_norm_hs and the
+        #    grad_norm_weight reduction (atomic_add over H slots).
+        BLOCK_H = triton.next_power_of_2(H)
+        grad_prenorm_hs = torch.zeros(BT_H_shape, dtype=dtype, device=grad_norm_hs.device)
+        grad_norm_weight_acc = torch.zeros(H, dtype=torch.float32, device=grad_norm_hs.device)
+
+        d_loss_f32 = d_loss.detach().to(torch.float32).contiguous()
+
+        _rms_norm_bwd_scatter_kernel[(N,)](
+            grad_norm_hs, hs, rstd, norm_weight, valid_idx,
+            grad_prenorm_hs, grad_norm_weight_acc, d_loss_f32,
+            H_const=H, BLOCK_H=BLOCK_H,
+            num_warps=8,
+        )
+
+        grad_norm_weight = grad_norm_weight_acc.to(norm_weight.dtype)
+
+        # Return order matches forward inputs:
+        # (prenorm_hs, target_p, lm_head_w, valid_idx, norm_weight, norm_eps)
+        return grad_prenorm_hs, None, grad_lm_head, None, grad_norm_weight, None
 
 
 # ─── Public entry point (must match reference.eagle3_loss_ref signature) ─
@@ -295,13 +415,13 @@ def kernel_fn(
     lm_head_weight: torch.Tensor,     # (V, H)    bf16/fp16
     norm_eps: float,
 ) -> torch.Tensor:
-    """
-    Forward + backward Eagle3 forward-KL loss with argmax accuracy.
+    """Forward + backward Eagle3 forward-KL loss with argmax accuracy.
 
-    The gather + RMSNorm stays in eager PyTorch (autograd-natural) -- this
-    is the same partition Liger uses (fused_linear_jsd doesn't fuse layernorm).
-    The matmul + log_softmax + KL + accuracy stage is wrapped in a custom
-    autograd.Function that chunks over rows and saves only pre-computed grads.
+    Owns the entire pipeline (gather + RMSNorm + matmul + KL + accuracy +
+    grad precompute) in one autograd Function. Backward uses a custom
+    Triton kernel for RMSNorm-bwd + scatter + d_loss scaling + grad_norm_w
+    atomic_add reduction -- eliminating IndexSelectBackward and
+    FusedRmsNormBackward from the autograd graph.
 
     Returns:
         torch.stack([loss, acc]) -- shape (2,) fp32. out[0] is the autograd-
@@ -311,16 +431,9 @@ def kernel_fn(
     assert valid_idx.is_cuda and norm_weight.is_cuda and lm_head_weight.is_cuda
     assert valid_idx.dtype == torch.int64
 
-    # 1. Gather valid hidden states (eager, autograd-natural). target_p is NOT
-    #    gathered eagerly -- the Triton kernel reads target_p_flat[valid_idx]
-    #    directly, saving a (N, V) intermediate (~622 MB at prod scale).
-    hs = prenorm_hs_flat.index_select(0, valid_idx)                 # (N, H)
-
-    # 2. RMSNorm via the fused PyTorch op (autograd-aware, fp32-internal).
-    norm_hs = F.rms_norm(hs, (hs.shape[-1],), weight=norm_weight, eps=norm_eps)  # (N, H)
-
-    # 3. Custom autograd-aware fused matmul + KL + accuracy. Pass
-    #    target_p_flat + valid_idx so the kernel gathers per-row.
-    loss, acc = _Eagle3LossFn.apply(norm_hs, target_p_flat, lm_head_weight, valid_idx)
+    loss, acc = _Eagle3FullFn.apply(
+        prenorm_hs_flat, target_p_flat, lm_head_weight,
+        valid_idx, norm_weight, norm_eps,
+    )
 
     return torch.stack([loss.float(), acc.float()])
