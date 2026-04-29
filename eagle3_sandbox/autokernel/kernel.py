@@ -45,8 +45,8 @@ import triton.language as tl
 # ─── Tunables (agent edits these) ──────────────────────────────────────────
 # Cap on the inner kernel's V-block. Liger ships with 32768 on non-HIP and
 # notes the kernel is "quite sensitive to num_warps" (cross_entropy.py:410).
-MAX_FUSED_SIZE = 32768
-KERNEL_NUM_WARPS = 32
+MAX_FUSED_SIZE = 16384
+KERNEL_NUM_WARPS = 16
 
 # Chunk-memory budget for the in-place (cn, V) bf16 logits buffer.
 # Liger's formula chunk_size = next_pow2(N*H/V) keeps chunk memory ≈ N*H, but
