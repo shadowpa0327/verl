@@ -53,7 +53,7 @@ KERNEL_NUM_WARPS = 32
 # at V=152K that gives chunk_size=64 -- too thin for tensor-core matmul. We
 # bound the chunk by an absolute byte budget instead, which yields larger
 # chunks at prod (chunk_size≈512 at V=152K) and full N at large (V≤32K).
-CHUNK_LOGITS_BYTES_BUDGET = 256 * 1024 * 1024
+CHUNK_LOGITS_BYTES_BUDGET = 512 * 1024 * 1024
 
 
 # ─── Triton kernel: per-row online softmax + KL loss + in-place d_logits ──
