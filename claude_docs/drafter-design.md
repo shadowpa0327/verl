@@ -88,7 +88,7 @@ Drafter mesh dispatch                             ← verl handles, per-rank
 update_drafter(data) per worker                   ← GPU, per rank
    1. Mooncake.get(key) for each sample → ids, hidden_states, last_hidden_states
    2. Build response-only loss_mask = [0]*plen + [1]*(rlen-1) + [0]
-   3. Eagle3Collator pads to [B, T_pad] / [B, T_pad, D]
+   3. DataCollatorWithPadding pads to [B, T_pad] / [B, T_pad, D]
    4. prepare_model_inputs (left-shift input_ids + last_hidden_states by 1)
    5. Eagle3Model.forward (7-step TTT)
    6. 0.8^i weighted backward
@@ -98,7 +98,7 @@ update_drafter(data) per worker                   ← GPU, per rank
 ```
 
 `SampleMeta` and `DrafterDataController` definitions:
-`recipe/drafter_cotraining/controller.py`.
+`recipe/drafter_cotraining/data/controller.py`.
 
 ---
 
@@ -172,7 +172,7 @@ this.
 
 ## Drafter training step
 
-`update_drafter` in `recipe/drafter_cotraining/engine_workers.py` runs
+`update_drafter` in `recipe/drafter_cotraining/engine/workers.py` runs
 a paged-Mooncake-fetch + micro-batch accumulation loop (mirrors verl's
 canonical `forward_backward_batch` divisor pattern):
 
@@ -195,7 +195,7 @@ canonical `forward_backward_batch` divisor pattern):
    2. **Paged Mooncake fetch** — `_fetch_drafter_batch_from_mooncake`
       pulls just this micro-batch's keys, builds the response-only
       `loss_mask = [0]*plen + [1]*(rlen-1) + [0]` per sample, calls
-      `Eagle3Collator(features, bucket_size_override=T_pad_macro)`,
+      `DataCollatorWithPadding(features, bucket_size_override=T_pad_macro)`,
       then `EagleMooncakeStore.remove_eagle3_tensors(key)` per key
       (eager cleanup).
    3. **Prepare** — `FSDPDrafterEngine.prepare_model_inputs`
@@ -234,7 +234,7 @@ The drafter engine uses FSDP2 (`torch.distributed.fsdp.fully_shard`)
 with a selective wrap that mirrors TorchSpec's pattern: shard **only**
 `LlamaDecoderLayer` sub-units; let `lm_head`, `model.norm`, `fc`, and
 `embed_tokens` fall under the root `fully_shard` call. The override
-lives in `FSDPDrafterEngine._build_fsdp_module` (drafter_engine.py).
+lives in `FSDPDrafterEngine._build_fsdp_module` (engine/drafter_engine.py).
 
 **Why selective wrap (not verl's default `apply_fsdp2`):** verl's
 `_select_fsdp2_wrap_targets` (`fsdp_utils.py:510-531`) wraps

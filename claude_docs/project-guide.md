@@ -68,11 +68,11 @@ Concrete guidance:
 
 | Change kind | Where it goes |
 |---|---|
-| Drafter worker / engine logic | `recipe/drafter_cotraining/{engine_workers,drafter_engine}.py` |
+| Drafter worker / engine logic | `recipe/drafter_cotraining/engine/{workers,drafter_engine}.py` |
 | Eagle3 model / loss / draft | `recipe/drafter_cotraining/eagle3/...` |
 | Mooncake transfer / KV connector | `recipe/drafter_cotraining/mooncake/...` |
 | HS collector manager | `recipe/drafter_cotraining/hs_collector/...` |
-| Drafter trainer / controller | `recipe/drafter_cotraining/{ray_trainer,controller,main_drafter_ct,orchestration}.py` |
+| Drafter trainers / data controller / launchers | `recipe/drafter_cotraining/{main_drafter_ct,main_drafter_pretrain}.py` + `trainer/{ray_trainer,pretrain_trainer}.py` + `data/controller.py` |
 | Test / smoke scripts | `recipe/drafter_cotraining/scripts/...` |
 | Drafter unit tests | `recipe/drafter_cotraining/tests/...` |
 | Drafter YAML config / draft model JSONs | `recipe/drafter_cotraining/config/...` |
@@ -157,7 +157,7 @@ Handles gradient computation: forward/backward/optimizer.
 ```
 BaseEngine
 ├── FSDPEngine           (engine/fsdp/transformer_impl.py)
-├── FSDPDrafterEngine    (recipe/drafter_cotraining/drafter_engine.py)   ← submodule
+├── FSDPDrafterEngine    (recipe/drafter_cotraining/engine/drafter_engine.py)   ← submodule
 ├── MegatronEngine       (engine/megatron/transformer_impl.py)
 ├── VeOmniEngine         (engine/veomni/transformer_impl.py)
 └── MindspeedEngine      (engine/mindspeed/transformer_impl.py)
