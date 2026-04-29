@@ -189,8 +189,10 @@ class _Eagle3LossFn(torch.autograd.Function):
         num_chunks = triton.cdiv(N, chunk_size)
 
         # ── Output buffers ──────────────────────────────────────────────
-        loss_per_row = torch.zeros(N, dtype=torch.float32, device=device)
-        correct_per_row = torch.zeros(N, dtype=torch.float32, device=device)
+        # No zero-init: kernel writes every entry of loss_per_row and
+        # correct_per_row across all chunks (s:e ranges cover [0, N)).
+        loss_per_row = torch.empty(N, dtype=torch.float32, device=device)
+        correct_per_row = torch.empty(N, dtype=torch.float32, device=device)
 
         # ── Pre-computed gradients (saved for backward; NOT logits/log_p) ──
         # Skip the zero-init: grad_norm_hs is overwritten chunk-by-chunk via
@@ -199,6 +201,9 @@ class _Eagle3LossFn(torch.autograd.Function):
         # prod scale (V=152K, H=4096, bf16).
         grad_norm_hs = torch.empty_like(norm_hs)
         grad_lm_head = torch.empty_like(lm_head_w)
+        # Reused (chunk_size, V) buffer for the in-place logits/d_logits.
+        # Avoids per-chunk alloc-free of a 311 MB (prod) bf16 tensor.
+        logits_buf = torch.empty((chunk_size, V), dtype=dtype, device=device)
 
         inv_N = 1.0 / max(1, N)
 
@@ -215,7 +220,8 @@ class _Eagle3LossFn(torch.autograd.Function):
             # 1. Matmul in native dtype (bf16/fp16) with tensor-core fp32
             #    accumulation. Output stays in dtype -- no fp32 cast of the
             #    (V, H) lm_head_w (~512 MB at large size, ~2.5 GB at prod).
-            logits_chunk = torch.matmul(norm_hs_chunk, lm_head_w.T)  # (cn, V) dtype
+            logits_chunk = logits_buf[:cn]                    # (cn, V) view
+            torch.matmul(norm_hs_chunk, lm_head_w.T, out=logits_chunk)
 
             # 2. Triton kernel: writes d_logits in-place into logits_chunk;
             #    fills loss_per_row[s:e] and correct_per_row[s:e]. Internal
@@ -244,7 +250,7 @@ class _Eagle3LossFn(torch.autograd.Function):
             else:
                 grad_lm_head.addmm_(logits_chunk.T, norm_hs_chunk)
 
-            # logits_chunk goes out of scope here -- the (cn, V) buffer is freed.
+            # logits_chunk is a view into logits_buf -- reused next iter.
 
         # ── Reductions ──────────────────────────────────────────────────
         loss = loss_per_row.sum() / max(1, N)
