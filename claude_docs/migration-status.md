@@ -36,14 +36,14 @@ raw prompt → rollout → hidden states (Mooncake) → mesh dispatch
 
 | Component | File |
 |---|---|
-| Drafter worker | `engine_workers.py` (`ActorRolloutRefDrafterWorker`) |
-| Drafter engine | `drafter_engine.py` (`FSDPDrafterEngine`, `DrafterModelConfig`) |
-| Trainer + entry point | `ray_trainer.py`, `main_drafter_ct.py` |
-| Data controller | `controller.py` (`DrafterDataController`, `SampleMeta`) |
+| Drafter worker | `engine/workers.py` (`ActorRolloutRefDrafterWorker`) |
+| Drafter engine | `engine/drafter_engine.py` (`FSDPDrafterEngine`, `DrafterModelConfig`) |
+| Trainers + entry points | `trainer/ray_trainer.py` + `main_drafter_ct.py` (RL); `trainer/pretrain_trainer.py` + `main_drafter_pretrain.py` (pretrain) |
+| Data controller | `data/controller.py` (`DrafterDataController`, `SampleMeta`) |
 | Eagle3 model + loss | `eagle3/{eagle3_model,draft/,ops/}` |
 | Mooncake transport | `mooncake/` (KV connector, store, master) |
 | HS collector | `hs_collector/` (`HSCollectorManager`) |
-| Eagle3 collator | `eagle3_collator.py` |
+| Generic data collator | `data/collator.py` (`DataCollatorWithPadding`) |
 | Smoke harness | `scripts/test_drafter_{rollout_hs,training,training_offline}.py` |
 
 **Parent verl carve-out** (one file): the 3-line `kv_transfer_params`
@@ -92,9 +92,9 @@ Three-phase refactor; design + rationale in
 
 | Phase | Change | Files |
 |---|---|---|
-| **A — Kernel fix** | Drop `LazyTarget` + `compiled_forward_kl_loss_from_hs`; generalize `compute_target_p_padded` to support `t2d=None` (no-pruning); store `target_p` as bf16. | `eagle3/eagle3_model.py`, `eagle3/ops/loss.py`, `drafter_engine.py::prepare_model_inputs`, `tests/test_eagle3_loss.py` |
-| **B — FSDP2 wrap** | Override `FSDPDrafterEngine._build_fsdp_module` for selective wrap (only `LlamaDecoderLayer`). Yaml: `strategy: fsdp → fsdp2`, drop `use_orig_params`. | `drafter_engine.py`, both yaml configs |
-| **C — Micro-batching** | Paged Mooncake fetch + per-mb weighted backward; metadata-time empty-mask filter; `total_valid_global` preflight; `T_pad_macro` precompute; `set_requires_gradient_sync(is_last)` on FSDP2 root. New helpers: `_allreduce_sum_int`, `_select_data_indices`, `_iter_micro_batch_keys`, `_drafter_train_step_micro`, `_drafter_micro_step`, `_aggregate_micro_metrics`. New `Eagle3Collator(features, bucket_size_override=...)`. New yaml `drafter.engine_config.micro_batch_size_per_gpu` (default 1). | `engine_workers.py`, `eagle3_collator.py`, both yaml configs |
+| **A — Kernel fix** | Drop `LazyTarget` + `compiled_forward_kl_loss_from_hs`; generalize `compute_target_p_padded` to support `t2d=None` (no-pruning); store `target_p` as bf16. | `eagle3/eagle3_model.py`, `eagle3/ops/loss.py`, `engine/drafter_engine.py::prepare_model_inputs`, `tests/test_eagle3_loss.py` |
+| **B — FSDP2 wrap** | Override `FSDPDrafterEngine._build_fsdp_module` for selective wrap (only `LlamaDecoderLayer`). Yaml: `strategy: fsdp → fsdp2`, drop `use_orig_params`. | `engine/drafter_engine.py`, both yaml configs |
+| **C — Micro-batching** | Paged Mooncake fetch + per-mb weighted backward; metadata-time empty-mask filter; `total_valid_global` preflight; `T_pad_macro` precompute; `set_requires_gradient_sync(is_last)` on FSDP2 root. New helpers: `_allreduce_sum_int`, `_select_data_indices`, `_iter_micro_batch_keys`, `_drafter_train_step_micro`, `_drafter_micro_step`, `_aggregate_micro_metrics`. New `DataCollatorWithPadding(features, bucket_size_override=...)`. New yaml `drafter.engine_config.micro_batch_size_per_gpu` (default 1). | `engine/workers.py`, `data/collator.py`, both yaml configs |
 | **E — Rename** | `recipe/drafter_cotraining/fsdp_workers.py` → `engine_workers.py` (engine-agnostic pattern; FSDP-naming was misleading). | recipe + claude_docs |
 
 **Verification command** (Qwen3-8B pretrain — actively developed path):
@@ -117,7 +117,7 @@ Two-axis verification:
 
 ### TODO 4 — Drafter → rollout weight sync (not a blocker)
 
-`recipe/drafter_cotraining/engine_workers.py::update_weights` currently
+`recipe/drafter_cotraining/engine/workers.py::update_weights` currently
 has a `pass` placeholder. `engine.get_per_tensor_param()` already
 returns drafter weights; the rollout side needs an
 `update_drafter_weights()` API to receive them. Required only for
