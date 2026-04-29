@@ -47,6 +47,13 @@ import triton.language as tl
 # Larger blocks → fewer iterations but higher register pressure.
 MAX_FUSED_SIZE = 65536
 
+# Chunk-memory budget for the in-place (cn, V) bf16 logits buffer.
+# Liger's formula chunk_size = next_pow2(N*H/V) keeps chunk memory ≈ N*H, but
+# at V=152K that gives chunk_size=64 -- too thin for tensor-core matmul. We
+# bound the chunk by an absolute byte budget instead, which yields larger
+# chunks at prod (chunk_size≈512 at V=152K) and full N at large (V≤32K).
+CHUNK_LOGITS_BYTES_BUDGET = 256 * 1024 * 1024
+
 
 # ─── Triton kernel: per-row online softmax + KL loss + in-place d_logits ──
 # Pattern lifted from liger_kernel/ops/cross_entropy.py (online softmax) and
@@ -155,10 +162,18 @@ class _Eagle3LossFn(torch.autograd.Function):
         N, H = norm_hs.shape
         V, _ = lm_head_w.shape
 
-        # ── Chunking schedule (Liger pattern) ───────────────────────────
+        # ── Chunking schedule (memory-budget pattern) ───────────────────
         BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
-        inc_factor = triton.cdiv(V, H)
-        chunk_size = max(1, triton.next_power_of_2(triton.cdiv(N, inc_factor)))
+        # Cap chunk_size by an absolute bf16 byte budget so prod (V=152K)
+        # gets ≥256-row chunks instead of the 64 rows that Liger's V-relative
+        # formula produces. At V≤32K chunk_size lands at N (single matmul).
+        elem_bytes = max(1, dtype.itemsize)
+        budget_rows = max(1, CHUNK_LOGITS_BYTES_BUDGET // (V * elem_bytes))
+        chunk_size = min(N, max(1, triton.next_power_of_2(budget_rows)))
+        # next_power_of_2 may overshoot; if budget_rows is not pow2 the rounded
+        # chunk_size could exceed budget_rows × 2 -- cap back to keep budget.
+        if chunk_size > budget_rows:
+            chunk_size = max(1, chunk_size // 2)
         num_chunks = triton.cdiv(N, chunk_size)
 
         # ── Output buffers ──────────────────────────────────────────────
