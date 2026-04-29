@@ -43,9 +43,10 @@ import triton.language as tl
 
 
 # ─── Tunables (agent edits these) ──────────────────────────────────────────
-# Cap on the inner kernel's V-block. Liger uses 32K-64K depending on device.
-# Larger blocks → fewer iterations but higher register pressure.
-MAX_FUSED_SIZE = 65536
+# Cap on the inner kernel's V-block. Liger ships with 32768 on non-HIP and
+# notes the kernel is "quite sensitive to num_warps" (cross_entropy.py:410).
+MAX_FUSED_SIZE = 32768
+KERNEL_NUM_WARPS = 32
 
 # Chunk-memory budget for the in-place (cn, V) bf16 logits buffer.
 # Liger's formula chunk_size = next_pow2(N*H/V) keeps chunk memory ≈ N*H, but
@@ -218,7 +219,7 @@ class _Eagle3LossFn(torch.autograd.Function):
                 logits_chunk.stride(0),
                 tp_chunk.stride(0),
                 BLOCK_SIZE=BLOCK_SIZE,
-                num_warps=8,
+                num_warps=KERNEL_NUM_WARPS,
             )
 
             # 3. Backprop matmul using d_logits (now in logits_chunk):
