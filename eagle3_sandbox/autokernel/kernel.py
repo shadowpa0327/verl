@@ -61,8 +61,9 @@ CHUNK_LOGITS_BYTES_BUDGET = 512 * 1024 * 1024
 # fused_linear_jsd.py (target-distribution KL + d_logits = softmax - target).
 @triton.jit
 def _eagle3_kl_loss_kernel(
-    X_ptr,            # (CN, V)  logits chunk, fp32; OVERWRITTEN with d_logits
-    TP_ptr,           # (CN, V)  target_p chunk, source dtype, read-only
+    X_ptr,            # (CN, V)  logits chunk; OVERWRITTEN with d_logits
+    TP_ptr,           # (B*T, V) full target_p, read-only (gathered via TP_idx)
+    TP_idx_ptr,       # (CN,)    int64, row indices into TP_ptr
     loss_ptr,         # (CN,)    fp32, per-row -sum(tp * log_p) (positive)
     correct_ptr,      # (CN,)    fp32, 1.0 if argmax(logits) == argmax(tp)
     n_cols,           # V
@@ -84,7 +85,10 @@ def _eagle3_kl_loss_kernel(
     """
     row = tl.program_id(0)
     X_row = X_ptr + row * X_row_stride
-    TP_row = TP_ptr + row * TP_row_stride
+    # Gather target_p row via valid_idx -- avoids materializing the
+    # (N, V) gathered target_p tensor.
+    real_row = tl.load(TP_idx_ptr + row)
+    TP_row = TP_ptr + real_row * TP_row_stride
 
     # ── Pass 1a: online softmax + argmax over logits ────────────────────
     m = float("-inf")
@@ -149,12 +153,19 @@ class _Eagle3LossFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, norm_hs: torch.Tensor, tp: torch.Tensor, lm_head_w: torch.Tensor):
+    def forward(
+        ctx,
+        norm_hs: torch.Tensor,
+        target_p_flat: torch.Tensor,
+        lm_head_w: torch.Tensor,
+        valid_idx: torch.Tensor,
+    ):
         """
         Args:
-            norm_hs   (N, H)  bf16/fp16 -- post-RMSNorm draft hidden states
-            tp        (N, V)  bf16/fp16 -- gathered target probabilities
-            lm_head_w (V, H)  bf16/fp16 -- draft lm_head weight
+            norm_hs        (N, H)     bf16/fp16 -- post-RMSNorm draft hs
+            target_p_flat  (B*T, V)   bf16/fp16 -- ungathered target probs
+            lm_head_w      (V, H)     bf16/fp16 -- draft lm_head weight
+            valid_idx      (N,)       int64     -- row indices into target_p_flat
         Returns:
             loss (scalar fp32), acc (scalar fp32)
         """
@@ -199,7 +210,7 @@ class _Eagle3LossFn(torch.autograd.Function):
                 break
 
             norm_hs_chunk = norm_hs[s:e]                      # (cn, H)
-            tp_chunk = tp[s:e]                                # (cn, V) contiguous
+            valid_idx_chunk = valid_idx[s:e]                  # (cn,) int64
 
             # 1. Matmul in native dtype (bf16/fp16) with tensor-core fp32
             #    accumulation. Output stays in dtype -- no fp32 cast of the
@@ -211,13 +222,14 @@ class _Eagle3LossFn(torch.autograd.Function):
             #    accumulators are fp32; load/store dtype matches X_ptr.
             _eagle3_kl_loss_kernel[(cn,)](
                 logits_chunk,
-                tp_chunk,
+                target_p_flat,
+                valid_idx_chunk,
                 loss_per_row[s:e],
                 correct_per_row[s:e],
                 V,
                 inv_N,
                 logits_chunk.stride(0),
-                tp_chunk.stride(0),
+                target_p_flat.stride(0),
                 BLOCK_SIZE=BLOCK_SIZE,
                 num_warps=KERNEL_NUM_WARPS,
             )
@@ -245,10 +257,9 @@ class _Eagle3LossFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, d_loss: torch.Tensor, d_acc: torch.Tensor):
         """Backward = scale saved grads by d_loss. d_acc is unused (argmax
-        is non-differentiable -- no gradient path through it)."""
+        is non-differentiable). target_p_flat and valid_idx have no grads."""
         grad_norm_hs, grad_lm_head = ctx.saved_tensors
-        # Scale by d_loss (scalar). d_acc is ignored.
-        return grad_norm_hs * d_loss, None, grad_lm_head * d_loss
+        return grad_norm_hs * d_loss, None, grad_lm_head * d_loss, None
 
 
 # ─── Public entry point (must match reference.eagle3_loss_ref signature) ─
@@ -276,16 +287,16 @@ def kernel_fn(
     assert valid_idx.is_cuda and norm_weight.is_cuda and lm_head_weight.is_cuda
     assert valid_idx.dtype == torch.int64
 
-    # 1. Gather valid rows (eager, autograd-natural).
+    # 1. Gather valid hidden states (eager, autograd-natural). target_p is NOT
+    #    gathered eagerly -- the Triton kernel reads target_p_flat[valid_idx]
+    #    directly, saving a (N, V) intermediate (~622 MB at prod scale).
     hs = prenorm_hs_flat.index_select(0, valid_idx)                 # (N, H)
-    tp = target_p_flat.index_select(0, valid_idx)                   # (N, V)
 
     # 2. RMSNorm via the fused PyTorch op (autograd-aware, fp32-internal).
-    #    Replaces the manual cast/pow/mean/rsqrt sequence with a single fused
-    #    forward + backward kernel. Drops a couple of (N, H) intermediates.
     norm_hs = F.rms_norm(hs, (hs.shape[-1],), weight=norm_weight, eps=norm_eps)  # (N, H)
 
-    # 3. Custom autograd-aware fused matmul + KL + accuracy.
-    loss, acc = _Eagle3LossFn.apply(norm_hs, tp, lm_head_weight)
+    # 3. Custom autograd-aware fused matmul + KL + accuracy. Pass
+    #    target_p_flat + valid_idx so the kernel gathers per-row.
+    loss, acc = _Eagle3LossFn.apply(norm_hs, target_p_flat, lm_head_weight, valid_idx)
 
     return torch.stack([loss.float(), acc.float()])
