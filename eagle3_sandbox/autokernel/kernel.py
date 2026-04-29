@@ -56,6 +56,17 @@ KERNEL_NUM_WARPS = 16
 CHUNK_LOGITS_BYTES_BUDGET = 512 * 1024 * 1024
 
 
+# ─── Triton kernel: in-place scalar scaling for backward grad ────────────
+@triton.jit
+def _scale_inplace_kernel(X_ptr, scalar_ptr, n_elems, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elems
+    x = tl.load(X_ptr + offs, mask=mask).to(tl.float32)
+    s = tl.load(scalar_ptr).to(tl.float32)
+    tl.store(X_ptr + offs, x * s, mask=mask)
+
+
 # ─── Triton kernel: per-row online softmax + KL loss + in-place d_logits ──
 # Pattern lifted from liger_kernel/ops/cross_entropy.py (online softmax) and
 # fused_linear_jsd.py (target-distribution KL + d_logits = softmax - target).
@@ -265,8 +276,13 @@ class _Eagle3LossFn(torch.autograd.Function):
         grads. The in-place mul avoids allocating (N, H) and (V, H) temporaries
         -- the latter is 1.2 GB at prod."""
         grad_norm_hs, grad_lm_head = ctx.saved_tensors
+        # Custom Triton scale-in-place for the large (V, H) buffer; aten's
+        # vectorized_elementwise_kernel runs at ~65% of peak BW on bf16 muls.
+        n_elems = grad_lm_head.numel()
+        BLOCK = 4096
+        grid = (triton.cdiv(n_elems, BLOCK),)
+        _scale_inplace_kernel[grid](grad_lm_head, d_loss, n_elems, BLOCK_SIZE=BLOCK, num_warps=4)
         grad_norm_hs.mul_(d_loss)
-        grad_lm_head.mul_(d_loss)
         return grad_norm_hs, None, grad_lm_head, None
 
 
