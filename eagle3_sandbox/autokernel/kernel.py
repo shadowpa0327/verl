@@ -280,13 +280,10 @@ def kernel_fn(
     hs = prenorm_hs_flat.index_select(0, valid_idx)                 # (N, H)
     tp = target_p_flat.index_select(0, valid_idx)                   # (N, V)
 
-    # 2. RMSNorm in fp32 (eager, autograd-natural).
-    #    Extension point: replace with a Liger-style fused RMSNorm kernel
-    #    (see liger_kernel/ops/rms_norm.py:_rms_norm_forward_kernel).
-    hs_f32 = hs.float()
-    variance = hs_f32.pow(2).mean(-1, keepdim=True)
-    rstd = torch.rsqrt(variance + norm_eps)
-    norm_hs = (hs_f32 * rstd).to(hs.dtype) * norm_weight            # (N, H)
+    # 2. RMSNorm via the fused PyTorch op (autograd-aware, fp32-internal).
+    #    Replaces the manual cast/pow/mean/rsqrt sequence with a single fused
+    #    forward + backward kernel. Drops a couple of (N, H) intermediates.
+    norm_hs = F.rms_norm(hs, (hs.shape[-1],), weight=norm_weight, eps=norm_eps)  # (N, H)
 
     # 3. Custom autograd-aware fused matmul + KL + accuracy.
     loss, acc = _Eagle3LossFn.apply(norm_hs, tp, lm_head_weight)
