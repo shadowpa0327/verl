@@ -379,9 +379,9 @@ class _Eagle3FullFn(torch.autograd.Function):
 
         # ── Scale grad_lm_head by d_loss in-place via Triton ────────────
         n_elems = grad_lm_head.numel()
-        BLOCK = 4096
+        BLOCK = 16384
         grid = (triton.cdiv(n_elems, BLOCK),)
-        _scale_inplace_kernel[grid](grad_lm_head, d_loss, n_elems, BLOCK_SIZE=BLOCK, num_warps=4)
+        _scale_inplace_kernel[grid](grad_lm_head, d_loss, n_elems, BLOCK_SIZE=BLOCK, num_warps=8)
 
         # ── RMSNorm bwd + scatter to grad_prenorm_hs in one custom kernel.
         #    Also folds the d_loss scaling on grad_norm_hs and the
