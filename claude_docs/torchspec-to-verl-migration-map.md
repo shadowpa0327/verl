@@ -30,17 +30,17 @@ verifier then accepts/rejects the speculated tokens.
 
 | Concept | TorchSpec | recipe/drafter_cotraining |
 |---|---|---|
-| Async controller | `controller/training_controller.py` (Ray actor, 4 FIFOs) | `controller.py` (in-process driver, 2 stores + mesh dispatch) |
-| Outer loop | `controller/loop.py::training_loop` (async dispatch + retry) | `ray_trainer.py::RayDrafterCTPPOTrainer.fit()` (synchronous, folded into RL loop) |
+| Async controller | `controller/training_controller.py` (Ray actor, 4 FIFOs) | `data/controller.py` (in-process driver, 2 stores + mesh dispatch) |
+| Outer loop | `controller/loop.py::training_loop` (async dispatch + retry) | `trainer/ray_trainer.py::RayDrafterCTPPOTrainer.fit()` (synchronous, folded into RL loop) |
 | Trainer entry | `train_entry.py` | `main_drafter_ct.py::DrafterCTTaskRunner` |
 | Eagle3 model + TTT loop | `models/eagle3.py` (`Eagle3Model`) | `eagle3/eagle3_model.py` — same 7-step TTT loop |
 | Forward KL loss kernel | `models/ops/loss.py` (`compiled_forward_kl_loss[_from_hs]`) | `eagle3/ops/loss.py` — identical |
 | Loss-mask helpers | `models/ops/loss_mask.py` (assistant-header Numba scan) | `eagle3/ops/loss_mask.py` — copy; not used in our RL flow (we have explicit prompt/response_len) |
 | Draft model arch | `models/draft/{auto,base,llama3_eagle}.py` | `eagle3/draft/` — same files |
-| Trainer init | `training/eagle3_trainer.py::init_model` | `drafter_engine.py::FSDPDrafterEngine._build_module` + `initialize` + `_load_target_frozen_weights` |
-| Forward step | `training/eagle3_trainer.py::_forward` | `drafter_engine.py::prepare_model_inputs` (with the `padding(..., left=False)` shift) + `Eagle3Model.forward` |
-| 0.8^i backward + accumulation | `training/eagle3_trainer.py::_backward` | `fsdp_workers.py::_drafter_train_step` |
-| Metric aggregation | `training/eagle3_trainer.py::_aggregate_metrics` | `fsdp_workers.py::_aggregate_drafter_metrics` |
+| Trainer init | `training/eagle3_trainer.py::init_model` | `engine/drafter_engine.py::FSDPDrafterEngine._build_module` + `initialize` + `_load_target_frozen_weights` |
+| Forward step | `training/eagle3_trainer.py::_forward` | `engine/drafter_engine.py::prepare_model_inputs` (with the `padding(..., left=False)` shift) + `Eagle3Model.forward` |
+| 0.8^i backward + accumulation | `training/eagle3_trainer.py::_backward` | `engine/workers.py::_drafter_train_step` |
+| Metric aggregation | `training/eagle3_trainer.py::_aggregate_metrics` | `engine/workers.py::_aggregate_drafter_metrics` |
 | Mooncake KV store | `transfer/mooncake/{eagle_store,store,buffers,helpers}.py` | `mooncake/{eagle_store,store,buffers,helpers}.py` — copies |
 | vLLM HS connector | `inference/engine/vllm_engine.py` + `mooncake_hidden_states_connector.py` | `mooncake/hidden_states_connector.py` (KVConnectorBase_V1 implementation) + `hs_collector/` (replica manager) |
 | HS collection topology | Standalone Ray engine pool | Colocated vLLM replicas, time-multiplexed via sleep/wake |
