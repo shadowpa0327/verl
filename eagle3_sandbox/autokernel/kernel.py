@@ -167,9 +167,11 @@ class _Eagle3LossFn(torch.autograd.Function):
 
         # ── Pre-computed gradients (saved for backward; NOT logits/log_p)
         grad_norm_hs = torch.zeros_like(norm_hs)
-        # Accumulate d_lm_head in fp32 across chunks (Liger uses original dtype
-        # by default but accum_dtype=fp32 is the safer baseline for V=152K).
-        grad_lm_head = torch.zeros_like(lm_head_w, dtype=torch.float32)
+        # Accumulate d_lm_head in input dtype to avoid the (V, H) fp32 buffer
+        # (~512 MB at V=32K, H=4096; ~2.5 GB at V=152K). cublasLt's bf16 matmul
+        # uses fp32 accumulation per chunk; cross-chunk error is bounded by
+        # num_chunks ≈ ceil(V/H) which is small.
+        grad_lm_head = torch.zeros_like(lm_head_w)
 
         inv_N = 1.0 / max(1, N)
 
@@ -183,16 +185,14 @@ class _Eagle3LossFn(torch.autograd.Function):
             norm_hs_chunk = norm_hs[s:e]                      # (cn, H)
             tp_chunk = tp[s:e].contiguous()                   # (cn, V)
 
-            # 1. Materialize logits chunk in fp32 (so we can scribble d_logits
-            #    in-place without dtype conversion). Casting hs/W to fp32 here
-            #    is a baseline choice -- the agent can switch to bf16 inputs
-            #    with `tl.dot(..., out_dtype=tl.float32)` for a 2x bandwidth win.
-            logits_chunk = torch.matmul(
-                norm_hs_chunk.float(), lm_head_w.float().T
-            )  # (cn, V) fp32
+            # 1. Matmul in native dtype (bf16/fp16) with tensor-core fp32
+            #    accumulation. Output stays in dtype -- no fp32 cast of the
+            #    (V, H) lm_head_w (~512 MB at large size, ~2.5 GB at prod).
+            logits_chunk = torch.matmul(norm_hs_chunk, lm_head_w.T)  # (cn, V) dtype
 
             # 2. Triton kernel: writes d_logits in-place into logits_chunk;
-            #    fills loss_per_row[s:e] and correct_per_row[s:e].
+            #    fills loss_per_row[s:e] and correct_per_row[s:e]. Internal
+            #    accumulators are fp32; load/store dtype matches X_ptr.
             _eagle3_kl_loss_kernel[(cn,)](
                 logits_chunk,
                 tp_chunk,
@@ -209,8 +209,8 @@ class _Eagle3LossFn(torch.autograd.Function):
             # 3. Backprop matmul using d_logits (now in logits_chunk):
             #    d_norm_hs[chunk] = d_logits @ lm_head_w
             #    d_lm_head      += d_logits.T @ norm_hs_chunk
-            grad_norm_hs[s:e] = torch.matmul(logits_chunk, lm_head_w.float()).to(dtype)
-            grad_lm_head.addmm_(logits_chunk.T, norm_hs_chunk.float())
+            grad_norm_hs[s:e] = torch.matmul(logits_chunk, lm_head_w)
+            grad_lm_head.addmm_(logits_chunk.T, norm_hs_chunk)
 
             # logits_chunk goes out of scope here -- the (cn, V) buffer is freed.
 
@@ -219,7 +219,7 @@ class _Eagle3LossFn(torch.autograd.Function):
         acc = correct_per_row.mean()
 
         # ── Save ONLY pre-computed grads (Liger pattern) ───────────────
-        ctx.save_for_backward(grad_norm_hs, grad_lm_head.to(lm_head_w.dtype))
+        ctx.save_for_backward(grad_norm_hs, grad_lm_head)
         return loss, acc
 
     @staticmethod
