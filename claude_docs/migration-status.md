@@ -113,6 +113,45 @@ Two-axis verification:
 
 ---
 
+## Package layout refactor (2026-04-29)
+
+Cleanup pass to align `recipe/drafter_cotraining/` with verl's recipe
+convention (`main_<recipe>.py` launcher + `<name>_trainer.py` class)
+and group library modules by role. Top-level previously held 10
+scattered `.py` files; now holds only the two launchers.
+
+| Phase | Change | Files |
+|---|---|---|
+| **F1 — `utils/`** | `data_preprocessing.py` → `utils/chat_template_tokenize.py` (slimmed: public surface = `build_input_ids_and_loss_mask` only; helpers private). `vocab_mapping.py` → `utils/vocab_mapping.py`. Deleted teaching-only `scripts/example_truncation_walkthrough.py`. | `utils/` |
+| **F2 — `trainer/` + pretrain entry split** | `ray_trainer.py` → `trainer/ray_trainer.py`. `draft_model_pretrain_trainer.py` → `trainer/pretrain_trainer.py` (stripped `@hydra.main` block + inlined `_launch_mooncake_master_if_needed` into `run_draft_model_pretrain`). New `main_drafter_pretrain.py` launcher mirrors `main_drafter_ct.py`. | `trainer/`, new `main_drafter_pretrain.py` |
+| **F3 — `data/` + `engine/` + cleanup** | `controller.py` → `data/controller.py`. `Eagle3Collator` (in `eagle3_collator.py`) generalized to `DataCollatorWithPadding` in `data/collator.py` — auto-detects 2D vs 3D padding from `tensor.ndim`, drops missing optional keys via common-key intersection, auto-generates `attention_mask` from configurable `length_key`. `drafter_engine.py` → `engine/drafter_engine.py`. `engine_workers.py` → `engine/workers.py` (drop redundant `engine_` prefix). Deleted dead `orchestration.py` (no importers; design now realized in `trainer/ray_trainer.py`). | `data/`, `engine/` |
+
+**Final layout** (top-level = 2 launchers + `__init__.py` + 7 subpackages):
+
+```
+recipe/drafter_cotraining/
+├── __init__.py
+├── main_drafter_ct.py            ← RL launcher
+├── main_drafter_pretrain.py      ← pretrain launcher
+├── trainer/   {ray_trainer,pretrain_trainer}.py
+├── data/      {controller,collator}.py
+├── engine/    {drafter_engine,workers}.py
+├── utils/     {chat_template_tokenize,vocab_mapping}.py
+└── eagle3/  hs_collector/  mooncake/  config/  scripts/  tests/
+```
+
+**Verification:** AST-parsed all 58 `.py` files clean; live-imported every
+moved public symbol via the verl venv (utils + data + engine + trainer);
+zero stale path refs across active code + active design docs. Historical
+research notes under `claude_docs/research/` left intact.
+
+**Commit anchors** (recipe submodule, branch `deat/drafter-cotraining`):
+`7b36b14` (utils/) → `5c62ab2` (trainer/ + entry split) → `12fa571`
+(data/ + engine/ + cleanup) → `6bcc8cb` (straggler doc-comment fixups).
+Parent: `2da0ba2e` + `93d5888c`.
+
+---
+
 ## Open TODOs
 
 ### TODO 4 — Drafter → rollout weight sync (not a blocker)
