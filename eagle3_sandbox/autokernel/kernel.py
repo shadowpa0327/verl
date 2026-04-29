@@ -111,23 +111,13 @@ def _eagle3_kl_loss_kernel(
         val_x = tl.where(update, block_val, val_x)
     log_d = tl.log(d)
 
-    # ── Pass 1b: argmax over target_p ───────────────────────────────────
-    arg_t = 0
-    val_t = float("-inf")
-    for i in range(0, n_cols, BLOCK_SIZE):
-        offs = i + tl.arange(0, BLOCK_SIZE)
-        mask = offs < n_cols
-        tp = tl.load(TP_row + offs, mask=mask, other=float("-inf")).to(tl.float32)
-        block_arg = tl.argmax(tp, axis=0) + i
-        block_val = tl.max(tp, axis=0)
-        update = block_val > val_t
-        arg_t = tl.where(update, block_arg, arg_t)
-        val_t = tl.where(update, block_val, val_t)
-    correct = (arg_x == arg_t).to(tl.float32)
-    tl.store(correct_ptr + row, correct)
-
-    # ── Pass 2: loss + in-place d_logits ────────────────────────────────
+    # ── Pass 2: loss + in-place d_logits + argmax(target_p) ────────────
+    # target_p is in [0, 1]; masked slots loaded as 0.0 cannot beat any valid
+    # slot, so argmax over the loaded tile is correct without an explicit -inf
+    # fill. This eliminates the separate Pass 1b V-walk over target_p.
     row_loss = 0.0
+    arg_t = 0
+    val_t = -1.0  # any valid tp ≥ 0 will beat this
     for i in range(0, n_cols, BLOCK_SIZE):
         offs = i + tl.arange(0, BLOCK_SIZE)
         mask = offs < n_cols
@@ -139,7 +129,15 @@ def _eagle3_kl_loss_kernel(
         d_logits = (softmax - tp) * inv_N
         # Mask off out-of-bounds writes (don't smear past V)
         tl.store(X_row + offs, d_logits, mask=mask)
+        # Inline argmax(target_p) tracking, reusing the tp load above.
+        block_arg = tl.argmax(tp, axis=0) + i
+        block_val = tl.max(tp, axis=0)
+        update = block_val > val_t
+        arg_t = tl.where(update, block_arg, arg_t)
+        val_t = tl.where(update, block_val, val_t)
 
+    correct = (arg_x == arg_t).to(tl.float32)
+    tl.store(correct_ptr + row, correct)
     tl.store(loss_ptr + row, -row_loss)
 
 
