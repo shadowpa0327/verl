@@ -181,13 +181,13 @@ class _Eagle3LossFn(torch.autograd.Function):
         loss_per_row = torch.zeros(N, dtype=torch.float32, device=device)
         correct_per_row = torch.zeros(N, dtype=torch.float32, device=device)
 
-        # ── Pre-computed gradients (saved for backward; NOT logits/log_p)
-        grad_norm_hs = torch.zeros_like(norm_hs)
-        # Accumulate d_lm_head in input dtype to avoid the (V, H) fp32 buffer
-        # (~512 MB at V=32K, H=4096; ~2.5 GB at V=152K). cublasLt's bf16 matmul
-        # uses fp32 accumulation per chunk; cross-chunk error is bounded by
-        # num_chunks ≈ ceil(V/H) which is small.
-        grad_lm_head = torch.zeros_like(lm_head_w)
+        # ── Pre-computed gradients (saved for backward; NOT logits/log_p) ──
+        # Skip the zero-init: grad_norm_hs is overwritten chunk-by-chunk via
+        # out=, and grad_lm_head uses mm (overwrite) on the first chunk and
+        # addmm_ (accumulate) thereafter. This saves a 1.2 GB cudaMemset at
+        # prod scale (V=152K, H=4096, bf16).
+        grad_norm_hs = torch.empty_like(norm_hs)
+        grad_lm_head = torch.empty_like(lm_head_w)
 
         inv_N = 1.0 / max(1, N)
 
@@ -199,7 +199,7 @@ class _Eagle3LossFn(torch.autograd.Function):
                 break
 
             norm_hs_chunk = norm_hs[s:e]                      # (cn, H)
-            tp_chunk = tp[s:e].contiguous()                   # (cn, V)
+            tp_chunk = tp[s:e]                                # (cn, V) contiguous
 
             # 1. Matmul in native dtype (bf16/fp16) with tensor-core fp32
             #    accumulation. Output stays in dtype -- no fp32 cast of the
@@ -223,10 +223,14 @@ class _Eagle3LossFn(torch.autograd.Function):
             )
 
             # 3. Backprop matmul using d_logits (now in logits_chunk):
-            #    d_norm_hs[chunk] = d_logits @ lm_head_w
-            #    d_lm_head      += d_logits.T @ norm_hs_chunk
-            grad_norm_hs[s:e] = torch.matmul(logits_chunk, lm_head_w)
-            grad_lm_head.addmm_(logits_chunk.T, norm_hs_chunk)
+            #    d_norm_hs[chunk] = d_logits @ lm_head_w   (overwrite slice)
+            #    d_lm_head        = d_logits.T @ norm_hs   (chunk 0: overwrite)
+            #    d_lm_head       += d_logits.T @ norm_hs   (chunk ≥1: accumulate)
+            torch.matmul(logits_chunk, lm_head_w, out=grad_norm_hs[s:e])
+            if chunk_id == 0:
+                torch.matmul(logits_chunk.T, norm_hs_chunk, out=grad_lm_head)
+            else:
+                grad_lm_head.addmm_(logits_chunk.T, norm_hs_chunk)
 
             # logits_chunk goes out of scope here -- the (cn, V) buffer is freed.
 
