@@ -256,10 +256,14 @@ class _Eagle3LossFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, d_loss: torch.Tensor, d_acc: torch.Tensor):
-        """Backward = scale saved grads by d_loss. d_acc is unused (argmax
-        is non-differentiable). target_p_flat and valid_idx have no grads."""
+        """Backward = scale saved grads by d_loss in-place. d_acc is unused
+        (argmax is non-differentiable). target_p_flat and valid_idx have no
+        grads. The in-place mul avoids allocating (N, H) and (V, H) temporaries
+        -- the latter is 1.2 GB at prod."""
         grad_norm_hs, grad_lm_head = ctx.saved_tensors
-        return grad_norm_hs * d_loss, None, grad_lm_head * d_loss, None
+        grad_norm_hs.mul_(d_loss)
+        grad_lm_head.mul_(d_loss)
+        return grad_norm_hs, None, grad_lm_head, None
 
 
 # ─── Public entry point (must match reference.eagle3_loss_ref signature) ─
