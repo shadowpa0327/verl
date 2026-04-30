@@ -35,7 +35,7 @@ See **[`claude_docs/project-guide.md`](./claude_docs/project-guide.md)** for the
 - Don't over-engineer — this is research code, can be experimental.
 - Don't use too many try-catch unless necessary.
 - Use `tasks` to maintain todos.
-- **Zero verl core changes** — all drafter code lives in `recipe/drafter_cotraining/`. The verl/ submodule is used as-is from upstream.
+- **Minimal verl core changes** — all drafter code lives in `recipe/drafter_cotraining/`. Only 2 generic fixes in `vllm_async_server.py`: (1) `kv_transfer_params` propagation for KV connectors, (2) missing `return` on `collective_rpc`. Both are upstreamable as small PRs.
 - vLLM captures pre-norm last_hidden_states — `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` before target construction. The loss kernel's RMSNorm is for the draft model's own norm (separate).
 - vLLM 0.18+ required for KV connector API (`KVConnectorBase_V1`).
 - `DrafterPretrainWorker` has `self.rollout = None` — it never touches the vLLM rollout engine. Frozen weights are loaded from `target_model_path` on disk, not from a live actor.
