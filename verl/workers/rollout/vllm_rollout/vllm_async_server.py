@@ -183,12 +183,26 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        await self.engine.collective_rpc(
+        return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
         )
+
+    async def get_spec_decode_counters(self) -> dict[str, int]:
+        """Read vLLM speculative-decoding counters from the server process."""
+        from vllm.v1.metrics.reader import Counter, get_metrics_snapshot
+
+        counters = {"num_drafts": 0, "num_accepted_tokens": 0}
+        for metric in get_metrics_snapshot():
+            if metric.name == "vllm:spec_decode_num_drafts":
+                if isinstance(metric, Counter):
+                    counters["num_drafts"] += int(metric.value)
+            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                if isinstance(metric, Counter):
+                    counters["num_accepted_tokens"] += int(metric.value)
+        return counters
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         if self.node_rank != 0:
@@ -519,6 +533,9 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        kv_params = getattr(final_res, "kv_transfer_params", None)
+        if kv_params:
+            extra_fields["kv_transfer_params"] = kv_params
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
