@@ -77,12 +77,12 @@ falls back to `model.embed_tokens.weight`. Same convention as TorchSpec.
 - **NOT synced**: the drafter's own `lm_head` — trainable, part of the draft model.
 - **Current implementation**: at drafter init, all three are loaded directly from `target_model_path` (not from the actor module) — see `FSDPDrafterEngine._load_target_frozen_weights` and `_build_module`. This sidesteps FSDP1-sharded actor param access at the cost of needing `target_model_path` set in config.
 - **Re-sync after `update_actor()`**: `sync_frozen_modules_from_actor` is currently a **no-op stub**. Properly implementing this needs FSDP-aware gathering of the actor's sharded params; deferred. For the smoke (target frozen) it's not needed.
-- File: `recipe/drafter_cotraining/engine/drafter_engine.py` + `recipe/drafter_cotraining/engine/workers.py::_sync_drafter_frozen_modules`.
+- File: `recipe/drafter_cotraining/workers/drafter_engine.py` + `recipe/drafter_cotraining/workers/engine_workers.py::_sync_drafter_frozen_modules`.
 
 ### Flow 4 — Drafter → Rollout (trainable weights)
 - `self.drafter.engine.get_per_tensor_param()` returns the drafter's trainable params.
 - `self.rollout.update_drafter_weights(...)` — **not yet implemented** on the rollout side.
-- File: `recipe/drafter_cotraining/engine/workers.py::update_weights` (`pass` placeholder).
+- File: `recipe/drafter_cotraining/workers/engine_workers.py::update_weights` (`pass` placeholder).
 - Status: **TODO 4**. Required only for speculative-decoding rollout speedup, not for training correctness. TorchSpec analog: `_maybe_sync_draft_weights` in `controller/loop.py:42-73` (every 500 steps in the `train_with_decode` recipe).
 
 ---

@@ -172,7 +172,7 @@ this.
 
 ## Drafter training step
 
-`update_drafter` in `recipe/drafter_cotraining/engine/workers.py` runs
+`update_drafter` in `recipe/drafter_cotraining/workers/engine_workers.py` runs
 a paged-Mooncake-fetch + micro-batch accumulation loop (mirrors verl's
 canonical `forward_backward_batch` divisor pattern):
 

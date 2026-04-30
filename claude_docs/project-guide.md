@@ -68,7 +68,7 @@ Concrete guidance:
 
 | Change kind | Where it goes |
 |---|---|
-| Drafter worker / engine logic | `recipe/drafter_cotraining/engine/{workers,drafter_engine}.py` |
+| Drafter worker / engine logic | `recipe/drafter_cotraining/workers/{engine_workers,drafter_engine}.py` |
 | Eagle3 model / loss / draft | `recipe/drafter_cotraining/eagle3/...` |
 | Mooncake transfer / KV connector | `recipe/drafter_cotraining/mooncake/...` |
 | HS collector manager | `recipe/drafter_cotraining/hs_collector/...` |
@@ -157,7 +157,7 @@ Handles gradient computation: forward/backward/optimizer.
 ```
 BaseEngine
 ├── FSDPEngine           (engine/fsdp/transformer_impl.py)
-├── FSDPDrafterEngine    (recipe/drafter_cotraining/engine/drafter_engine.py)   ← submodule
+├── FSDPDrafterEngine    (recipe/drafter_cotraining/workers/drafter_engine.py)   ← submodule
 ├── MegatronEngine       (engine/megatron/transformer_impl.py)
 ├── VeOmniEngine         (engine/veomni/transformer_impl.py)
 └── MindspeedEngine      (engine/mindspeed/transformer_impl.py)

@@ -156,7 +156,7 @@ Parent: `2da0ba2e` + `93d5888c`.
 
 ### TODO 4 — Drafter → rollout weight sync (not a blocker)
 
-`recipe/drafter_cotraining/engine/workers.py::update_weights` currently
+`recipe/drafter_cotraining/workers/engine_workers.py::update_weights` currently
 has a `pass` placeholder. `engine.get_per_tensor_param()` already
 returns drafter weights; the rollout side needs an
 `update_drafter_weights()` API to receive them. Required only for
