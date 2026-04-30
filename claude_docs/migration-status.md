@@ -1,67 +1,62 @@
-# Drafter Co-Training — Migration Status
+# Drafter Pretrain — Migration Status
 
-Compact status snapshot. Detailed RCA, change log, and per-fix
-rationale all live in **`git log`** on `feat/drafter-cotraining`
-(parent) and `feat/drafter-cotraining` (recipe submodule).
+Compact status snapshot for the **pretrain-only** scope. Co-training (RL +
+drafter) is deferred — see §"Deferred: Co-Training" below.
 
 **Design:** `drafter-design.md`
-**TorchSpec mapping:** `torchspec-to-verl-migration-map.md`
 **Workflow:** `project-guide.md` → "Where to make changes — recipe submodule first"
 
 ---
 
 ## Where to make changes
 
-**Recipe submodule first.** All drafter library code lives in
-`recipe/drafter_cotraining/`. Touch parent `verl/...` only for verl-
-side base-class hooks, vLLM rollout integration, top-level wrapper
-scripts, or docs. Full guidance + workflow snippet in `project-guide.md`.
+**Recipe submodule only.** All drafter code lives in
+`recipe/drafter_cotraining/`. The parent `verl/` directory is used as-is
+from upstream — **zero verl core changes** in the pretrain-only scope.
 
 ---
 
-## Current state
+## Current scope: pretrain-only
 
-The drafter co-training pipeline is wired end-to-end and verified:
+Standalone EAGLE drafter pretraining pipeline — no RL loop, no actor,
+no rollout, no verl core modifications.
 
 ```
-raw prompt → rollout → hidden states (Mooncake) → mesh dispatch
-                                                            │
-                                                            ▼
-                                  forward → backward → optimizer.step
-                                                            │
-                                                            └── repeat
+parquet data → tokenize → HS collector (vLLM prefill, Mooncake KV)
+                                                    │
+                                                    ▼
+                              DrafterPretrainWorker: Mooncake.get → forward → backward → opt.step
+                                                    │
+                                                    └── repeat
 ```
 
-**All canonical code under `recipe/drafter_cotraining/`:**
+**Active code under `recipe/drafter_cotraining/`:**
 
 | Component | File |
 |---|---|
-| Drafter worker | `engine/workers.py` (`ActorRolloutRefDrafterWorker`) |
-| Drafter engine | `engine/drafter_engine.py` (`FSDPDrafterEngine`, `DrafterModelConfig`) |
-| Trainers + entry points | `trainer/ray_trainer.py` + `main_drafter_ct.py` (RL); `trainer/pretrain_trainer.py` + `main_drafter_pretrain.py` (pretrain) |
-| Data controller | `data/controller.py` (`DrafterDataController`, `SampleMeta`) |
+| Pretrain launcher | `main_drafter_pretrain.py` |
+| Pretrain trainer | `trainer/pretrain_trainer.py` (`DraftModelPretrainTrainer`) |
+| Pretrain worker | `workers/engine_workers.py` (`DrafterPretrainWorker`) |
+| Drafter engine | `workers/drafter_engine.py` (`FSDPDrafterEngine`, `DrafterModelConfig`) |
 | Eagle3 model + loss | `eagle3/{eagle3_model,draft/,ops/}` |
 | Mooncake transport | `mooncake/` (KV connector, store, master) |
 | HS collector | `hs_collector/` (`HSCollectorManager`) |
-| Generic data collator | `data/collator.py` (`DataCollatorWithPadding`) |
-| Smoke harness | `scripts/test_drafter_{rollout_hs,training,training_offline}.py` |
+| Data collator | `data/collator.py` (`DataCollatorWithPadding`) |
+| Chat template + tokenize | `utils/chat_template_tokenize.py` |
+| Vocab mapping | `utils/vocab_mapping.py` |
+| Pretrain config | `config/draft_model_pretrain_trainer.yaml` |
 
-**Parent verl carve-out** (one file): the 3-line `kv_transfer_params`
-propagation hook in
-`verl/workers/rollout/vllm_rollout/vllm_async_server.py` — generic
-improvement, no-op without an active KV connector. Queued as a
-separate small upstream PR.
-
-**Top-level smoke wrappers** (parent, shell out to recipe scripts):
-- `scripts/run_drafter_rollout_hs.sh` — rollout + HS dispatch (no training)
-- `scripts/run_drafter_training.sh` — full close-loop training
+**Key architectural point:** `DrafterPretrainWorker` extends bare `Worker`
+(not `ActorRolloutRefWorker`), sets `self.rollout = None`, and reuses
+`ActorRolloutRefDrafterWorker` methods via class-level attribute aliasing.
+Frozen weights (embed_tokens, target_lm_head_weight, verifier_norm) are
+loaded from `target_model_path` on disk — no live actor to sync from.
 
 ---
 
 ## Latest end-to-end verification
 
-Qwen3-4B / 2× H100 / `MAX_STEPS=16` post-cleanup smoke
-(`scripts/run_drafter_training.sh`):
+Qwen3-4B / 2× H100 / `MAX_STEPS=16` post-cleanup smoke:
 
 | metric | step 0 | step 15 | Δ |
 |---|---:|---:|---:|
@@ -71,17 +66,13 @@ Qwen3-4B / 2× H100 / `MAX_STEPS=16` post-cleanup smoke
 | `train/grad_norm` | 30.25 | 14.06 | finite throughout |
 | `train/lr` | 9.90e-05 | 0.00e+00 | cosine decay full course |
 
-Per-step wall-clock ~2.6s (gen 1.0s + HS 1.0s + drafter train 0.65s).
+**Verification command** (Qwen3-8B pretrain — actively developed path):
 
-Defaults match TorchSpec's Eagle3 training: `lr=1e-4`,
-`weight_decay=0`, `lr_warmup_steps_ratio=0.015`, `lr_scheduler_type=cosine`,
-`clip_grad=0.5`. **Engine: FSDP2 with TorchSpec-style selective wrap**
-(only `LlamaDecoderLayer` gets its own FSDP unit; `lm_head` / `norm`
-/ `fc` / `embed_tokens` stay in the root unit and remain gathered
-through backward). vLLM aux layer IDs default to `[2,18,33,35]`
-(TorchSpec post-layer +1 shift + final-layer append for Qwen3-4B 36
-layers). Loss mask is response-only with the final response position
-dropped.
+```bash
+DATA_DIR=/root/verl/data/qwen3_8b_eagle3_ultrachat \
+  ./recipe/drafter_cotraining/scripts/run_qwen3_8b_eagle3_pretrain.sh \
+  trainer.total_training_steps=16
+```
 
 ---
 
@@ -97,99 +88,135 @@ Three-phase refactor; design + rationale in
 | **C — Micro-batching** | Paged Mooncake fetch + per-mb weighted backward; metadata-time empty-mask filter; `total_valid_global` preflight; `T_pad_macro` precompute; `set_requires_gradient_sync(is_last)` on FSDP2 root. New helpers: `_allreduce_sum_int`, `_select_data_indices`, `_iter_micro_batch_keys`, `_drafter_train_step_micro`, `_drafter_micro_step`, `_aggregate_micro_metrics`. New `DataCollatorWithPadding(features, bucket_size_override=...)`. New yaml `drafter.engine_config.micro_batch_size_per_gpu` (default 1). | `engine/workers.py`, `data/collator.py`, both yaml configs |
 | **E — Rename** | `recipe/drafter_cotraining/fsdp_workers.py` → `engine_workers.py` (engine-agnostic pattern; FSDP-naming was misleading). | recipe + claude_docs |
 
-**Verification command** (Qwen3-8B pretrain — actively developed path):
-
-```bash
-DATA_DIR=/root/verl/data/qwen3_8b_eagle3_ultrachat \
-  ./recipe/drafter_cotraining/scripts/run_qwen3_8b_eagle3_pretrain.sh \
-  trainer.total_training_steps=16
-```
-
-Two-axis verification:
-- `micro_batch_size_per_gpu` = `data.train_batch_size / world_size` (single-shot equivalence; bitwise match against pre-refactor baseline).
-- `micro_batch_size_per_gpu=1` (full N-way accumulation; should match within `~1e-3` float-noise band).
-
-**Checkpoint break:** FSDP1 sharded checkpoints (FlatParameter layout) are not loadable by FSDP2 (DTensor layout). Smoke runs do not require resume — start fresh.
-
 ---
 
 ## Package layout refactor (2026-04-29)
 
 Cleanup pass to align `recipe/drafter_cotraining/` with verl's recipe
 convention (`main_<recipe>.py` launcher + `<name>_trainer.py` class)
-and group library modules by role. Top-level previously held 10
-scattered `.py` files; now holds only the two launchers.
-
-| Phase | Change | Files |
-|---|---|---|
-| **F1 — `utils/`** | `data_preprocessing.py` → `utils/chat_template_tokenize.py` (slimmed: public surface = `build_input_ids_and_loss_mask` only; helpers private). `vocab_mapping.py` → `utils/vocab_mapping.py`. Deleted teaching-only `scripts/example_truncation_walkthrough.py`. | `utils/` |
-| **F2 — `trainer/` + pretrain entry split** | `ray_trainer.py` → `trainer/ray_trainer.py`. `draft_model_pretrain_trainer.py` → `trainer/pretrain_trainer.py` (stripped `@hydra.main` block + inlined `_launch_mooncake_master_if_needed` into `run_draft_model_pretrain`). New `main_drafter_pretrain.py` launcher mirrors `main_drafter_ct.py`. | `trainer/`, new `main_drafter_pretrain.py` |
-| **F3 — `data/` + `engine/` + cleanup** | `controller.py` → `data/controller.py`. `Eagle3Collator` (in `eagle3_collator.py`) generalized to `DataCollatorWithPadding` in `data/collator.py` — auto-detects 2D vs 3D padding from `tensor.ndim`, drops missing optional keys via common-key intersection, auto-generates `attention_mask` from configurable `length_key`. `drafter_engine.py` → `engine/drafter_engine.py`. `engine_workers.py` → `engine/workers.py` (drop redundant `engine_` prefix). Deleted dead `orchestration.py` (no importers; design now realized in `trainer/ray_trainer.py`). | `data/`, `engine/` |
-
-**Final layout** (top-level = 2 launchers + `__init__.py` + 7 subpackages):
+and group library modules by role.
 
 ```
 recipe/drafter_cotraining/
 ├── __init__.py
-├── main_drafter_ct.py            ← RL launcher
-├── main_drafter_pretrain.py      ← pretrain launcher
+├── main_drafter_ct.py            ← RL launcher (DEFERRED)
+├── main_drafter_pretrain.py      ← pretrain launcher (ACTIVE)
 ├── trainer/   {ray_trainer,pretrain_trainer}.py
 ├── data/      {controller,collator}.py
-├── engine/    {drafter_engine,workers}.py
+├── engine/    {drafter_engine,workers}.py  (note: in workers/ not engine/ on disk)
+├── workers/   {engine_workers,drafter_engine}.py
 ├── utils/     {chat_template_tokenize,vocab_mapping}.py
 └── eagle3/  hs_collector/  mooncake/  config/  scripts/  tests/
 ```
 
-**Verification:** AST-parsed all 58 `.py` files clean; live-imported every
-moved public symbol via the verl venv (utils + data + engine + trainer);
-zero stale path refs across active code + active design docs. Historical
-research notes under `claude_docs/research/` left intact.
+---
 
-**Commit anchors** (recipe submodule, branch `deat/drafter-cotraining`):
-`7b36b14` (utils/) → `5c62ab2` (trainer/ + entry split) → `12fa571`
-(data/ + engine/ + cleanup) → `6bcc8cb` (straggler doc-comment fixups).
-Parent: `2da0ba2e` + `93d5888c`.
+## Scope narrowing: pretrain-only (2026-05-01)
+
+**Decision:** Ship pretrain-only first. Co-training (RL + drafter) is
+deferred to a future milestone. This eliminates all verl core changes.
+
+### What stays (pretrain-only scope)
+
+| Component | Why |
+|---|---|
+| `DrafterPretrainWorker` | Core pretrain worker — no actor/rollout/ref |
+| `DraftModelPretrainTrainer` | Standalone trainer — no PPO loop |
+| `main_drafter_pretrain.py` | Pretrain entry point |
+| `draft_model_pretrain_trainer.yaml` | Pretrain config |
+| `FSDPDrafterEngine` / `Eagle3Model` | Shared model engine |
+| HS collector + Mooncake | Shared infrastructure |
+| `DataCollatorWithPadding` / `chat_template_tokenize` | Shared data utils |
+| Vocab pruning | Shared feature |
+
+### What's deferred (co-training only, not needed for pretrain)
+
+| Component | File | Why deferred |
+|---|---|---|
+| `ActorRolloutRefDrafterWorker` | `workers/engine_workers.py` | Requires actor + rollout + ref + drafter co-location |
+| `RayDrafterCTPPOTrainer` | `trainer/ray_trainer.py` | PPO trainer with drafter sub-pipeline |
+| `main_drafter_ct.py` + `drafter_ct_trainer.yaml` | Entry + config | Co-training launcher |
+| `DrafterDataController` / `SampleMeta` | `data/controller.py` | Driver-side sample routing for RL loop |
+| vllm_rollout drafter APIs | `verl/workers/rollout/vllm_rollout/*` | `update_drafter_weights`, `inspect_drafter_sharing`, `get_drafter_weights`, `probe_target_param_norms`, `get_spec_decode_counters`, `_collect_shared_drafter_param_names` |
+| Actor → drafter frozen-module re-sync | `engine_workers.py::_sync_drafter_frozen_modules` | No live actor in pretrain |
+| Drafter → rollout weight sync (TODO 4) | `vllm_rollout/vllm_rollout.py` | No rollout in pretrain |
+
+### Verl core diff analysis (52bf6abb..HEAD)
+
+Only 3 files changed in verl/ core, all in `vllm_rollout/` — **all
+drafter-related and all eliminable for pretrain-only**:
+
+| File | +Lines | Change |
+|---|---|---|
+| `vllm_rollout/utils.py` | +289 | `_collect_shared_drafter_param_names`, `target_model="drafter"` in `update_weights_from_ipc`/`_update_weights`, `inspect_drafter_sharing`, `probe_target_param_norms`, `get_drafter_weights` (duplicated for Omni) |
+| `vllm_rollout/vllm_async_server.py` | +19 | `get_spec_decode_counters()`, `kv_transfer_params` propagation, missing `return` on `collective_rpc` |
+| `vllm_rollout/vllm_rollout.py` | +46 | `update_drafter_weights`, `get_drafter_weights`, `inspect_drafter_sharing`, `probe_target_param_norms`, `VERL_VLLM_FORCE_WEIGHT_SHM` env var |
+
+**Minor non-drafter changes** (could be upstreamed separately later):
+1. Bug fix: missing `return` on `collective_rpc` (line 186)
+2. `VERL_VLLM_FORCE_WEIGHT_SHM` env var for SHM weight transfer
+3. `kv_transfer_params` propagation for disaggregated serving
 
 ---
 
-## Open TODOs
+## Deferred: Co-Training (RL + Drafter)
 
-### TODO 4 — Drafter → rollout weight sync (not a blocker)
+### Re-enable plan (future milestone)
 
-`recipe/drafter_cotraining/workers/engine_workers.py::update_weights` currently
-has a `pass` placeholder. `engine.get_per_tensor_param()` already
-returns drafter weights; the rollout side needs an
-`update_drafter_weights()` API to receive them. Required only for
-speculative-decoding rollout speedup; training works without it.
+1. **Revert verl/ to upstream** — start from a clean `52bf6abb` (or newer upstream) base with zero drafter changes.
 
-TorchSpec equivalent: `_maybe_sync_draft_weights` in
-`controller/loop.py:42-73` — saves draft to disk, calls
-`engine.update_weights_from_disk(update_draft_model=True)`. Activated
-only for the `train_with_decode` recipe (every `decode_weight_sync_interval`
-steps, default 500).
+2. **Re-apply vllm_rollout drafter APIs as a small upstream PR** — the 3 files in `vllm_rollout/` are self-contained additions that could be upstreamed as optional drafter support. Key APIs:
+   - `update_drafter_weights` — receives drafter weights via IPC
+   - `get_drafter_weights` — exports drafter weights for snapshot/restore
+   - `inspect_drafter_sharing` — diagnostics for shared tensors
+   - `_collect_shared_drafter_param_names` — filters shared params during weight update
 
-### Smaller follow-ups
+3. **Re-enable `ActorRolloutRefDrafterWorker`** — extends `ActorRolloutRefWorker` with drafter training. The method bodies already exist (aliased into `DrafterPretrainWorker` today).
 
-- **Gradient accumulation** (single-step path is proven; trivial extension).
-- **Vocab pruning** (`draft_vocab_size < vocab_size` + `set_vocab_buffers`
-  preflight) — see `tasks/drafter-training-milestone.md` §4.5 for the
-  branch in `prepare_model_inputs` that would activate it.
-- **Actor → drafter frozen-module re-sync** after `update_actor()`. The
-  current `sync_frozen_modules_from_actor` is a no-op stub (target-
-  path init replaces it for the smoke). Properly implementing this
-  needs FSDP-aware gathering of actor params (the actor is FSDP1-
-  sharded, naive copy fails — caused one of the original RCA'd bugs).
+4. **Re-enable `RayDrafterCTPPOTrainer`** — inserts drafter sub-pipeline after rollout in the PPO loop.
+
+5. **Implement remaining weight sync flows** (from `weight-sync-flows.md`):
+   - Flow 2: Actor → HS Collector (currently stub)
+   - Flow 3: Actor → Drafter frozen-module re-sync (currently no-op)
+   - Flow 4: Drafter → Rollout weight sync (currently TODO 4)
+
+### Co-training files to preserve (don't delete)
+
+These files exist in the recipe submodule and are referenced by both
+paths. Do NOT delete them — just don't ship/activate them:
+
+- `workers/engine_workers.py` — contains both `ActorRolloutRefDrafterWorker` (deferred) and `DrafterPretrainWorker` (active)
+- `trainer/ray_trainer.py` — co-training PPO trainer
+- `main_drafter_ct.py` — co-training launcher
+- `config/drafter_ct_trainer.yaml` — co-training config
+- `data/controller.py` — driver-side sample routing
+
+---
+
+## Open TODOs (pretrain-only scope)
+
+### Active
+
+- **Vocab pruning end-to-end** — `compute_target_p_padded` supports both
+  pruning and no-pruning paths. To activate: provide a `local_path` JSON
+  template setting `draft_vocab_size < vocab_size`, populate `t2d` on
+  the engine, and pass it through `prepare_model_inputs`.
+- **Gradient accumulation** — single-step path is proven; trivial extension.
+
+### Deferred (co-training scope)
+
+- **Drafter → rollout weight sync** (TODO 4) — needs `update_drafter_weights` API on rollout side.
+- **Actor → drafter frozen-module re-sync** — needs FSDP-aware gathering of actor params.
+- **Actor → HS Collector weight sync** (Flow 2) — currently stub.
 
 ---
 
 ## History
 
 This branch added EAGLE drafter co-training as a new recipe submodule
-(`shadowpa0327/verl-recipe`, branch `feat/drafter-cotraining`) plus a
-minimal parent-side carve-out. The full timeline — initial TorchSpec
-port, in-tree → recipe migration, close-loop training activation,
-nine-fix RCA pass against TorchSpec, in-tree mirror cleanup — lives
-in commit messages on both branches:
+plus minimal parent-side carve-outs. Scope narrowed to pretrain-only on
+2026-05-01 to ship without verl core changes. The full timeline lives
+in commit messages:
 
 ```bash
 git log --oneline 52bf6abb..HEAD                      # parent

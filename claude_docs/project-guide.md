@@ -1,68 +1,59 @@
 # verl — RL Training Framework
 
 ## Project Context
-This is the verl codebase, an RL training framework (PPO/GRPO) being used as a migration target for FastRL (EAGLE co-training with speculative decoding).
+This is the verl codebase, an RL training framework (PPO/GRPO). The active work is EAGLE drafter **pretraining** — a standalone pipeline that trains a tiny draft model on hidden states extracted from a target model. Branch: `feat/draft-model-train`.
 
-**Active work:** EAGLE drafter co-training pipeline — porting TorchSpec's hidden states collection + Mooncake transport + Eagle3 training into verl's architecture. Branch: `feat/drafter-cotraining`.
+**Co-training (RL + drafter) is deferred** — see `migration-status.md` "Deferred: Co-Training".
 
-## Drafter Co-Training (Active Migration)
+## Drafter Pretrain (Active Scope)
 
 ### What We're Building
 
-EAGLE drafter co-training: train a tiny draft model (~2% of target params) alongside the RL policy. The drafter learns to predict the target model's output distribution, enabling speculative decoding at inference time.
+EAGLE drafter pretraining: train a tiny draft model (~2% of target params) on hidden states extracted from a frozen target model via a colocated vLLM HS collector. No RL loop, no actor training, no rollout weight sync.
 
 ```
-RL Step with Drafter Co-Training:
+Pretrain Loop:
 
-  generate_sequences()          → vLLM rollout
-  collect_hidden_states()       → vLLM HS collector (prefill-only, KV connector → Mooncake)
-  dispatch drafter data         → DrafterDataController on driver
-  update_drafter()              → FSDPDrafterEngine (Eagle3 Forward KL loss)
-  compute_log_prob()            → Actor engine
-  update_actor()                → Actor engine
-  update_weights()              → actor + drafter → rollout + HS collector
+  load parquet data              -> tokenize conversations, build loss masks
+  compute_hidden_states()        -> vLLM HS collector (prefill-only, KV connector -> Mooncake)
+  dispatch drafter data          -> per-rank mesh dispatch
+  update_drafter()               -> FSDPDrafterEngine (Eagle3 Forward KL loss)
+  evaluate_drafter()             -> (periodic) eval on held-out data
+  save_drafter_checkpoint()      -> (periodic) save checkpoint
 ```
 
 ### Architecture
 
 ```
-RayDrafterCTPPOTrainer (driver)
-├── DrafterDataController              ← owns sample_pool
-│     drain_as_dataproto() → mesh dispatch per DP rank
-├── HSCollectorManager                 ← colocated vLLM replicas + KV connector
-│     compute_hidden_states(batch) — wake → prefill → Mooncake → sleep
-│
-└── actor_rollout_wg
-    └── ActorRolloutRefDrafterWorker
-            ├── actor     (TrainingWorker → FSDPEngine)       [inherited]
-            ├── ref       (TrainingWorker → FSDPEngine)       [inherited]
-            ├── rollout   (BaseRollout → vLLM)                [inherited]
-            └── drafter   (TrainingWorker → FSDPDrafterEngine) [NEW]
+DraftModelPretrainTrainer (driver, CPU)
+|-- HSCollectorManager                 <- colocated vLLM replicas + KV connector
+|     compute_hidden_states(batch) -- wake -> prefill -> Mooncake -> sleep
+|
+`-- drafter_wg (RayWorkerGroup, GPU)
+    `-- DrafterPretrainWorker          <- extends Worker (NOT ActorRolloutRefWorker)
+            `-- drafter   (TrainingWorker -> FSDPDrafterEngine -> Eagle3Model)
+            [no actor, no ref, no rollout]
 ```
 
 ### Key Design Decisions
 
+- **Zero verl core changes** — all drafter code lives in `recipe/drafter_cotraining/`. The `verl/` directory is used as-is from upstream.
+- **DrafterPretrainWorker extends bare `Worker`** — not `ActorRolloutRefWorker`. Sets `self.rollout = None`, `self.actor = None`, `self.ref = None`. Reuses `ActorRolloutRefDrafterWorker` methods via class-level attribute aliasing.
+- **Frozen weights from disk** — `embed_tokens`, `target_lm_head_weight`, `verifier_norm` are loaded from `target_model_path` on disk at init. No live actor to sync from (no-op `_sync_drafter_frozen_modules`).
 - **vLLM for HS collection** — uses `extract_hidden_states` speculative config + custom `MooncakeHiddenStatesConnector` (KV connector). Zero patching of vLLM internals.
-- **Mooncake** as data plane — heavy tensors (hidden states) flow through Mooncake KV store. The 3-level pipeline only routes lightweight metadata (keys, shapes).
-- **DrafterDataController on driver** — mirrors verl's single-controller pattern. Levels 1 & 2 are global; Level 3 dispatch via `DataProto.chunk()` + drafter mesh.
-- **No unanimity gate** — the centralized controller + mesh dispatch guarantees all ranks get data or none do. Consensus by construction.
-- **Pre-norm handling** — vLLM captures `last_hidden_states` before the final RMSNorm (pre-norm). `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` (a frozen copy of the actor's `model.norm`) to normalize before target distribution computation. Note: the loss kernel's built-in RMSNorm is for the *draft* model's norm, not the verifier — these are separate.
+- **Mooncake** as data plane — heavy tensors (hidden states) flow through Mooncake KV store. The pipeline only routes lightweight metadata (keys, shapes).
+- **Pre-norm handling** — vLLM captures `last_hidden_states` before the final RMSNorm (pre-norm). `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` (a frozen copy of the target's `model.norm`) to normalize before target distribution computations.
 
-### Where to make changes — recipe submodule first
+### Where to make changes — recipe submodule only
 
-**All drafter-private code lives in the `recipe/drafter_cotraining/`
-submodule** (a git submodule pointing at `shadowpa0327/verl-recipe`,
-branch `feat/drafter-cotraining`). The in-tree `verl/...` mirrors that
-existed during the migration have been **deleted** as of 2026-04-23
-(see `migration-status.md` "cleanup" entry).
+**All drafter code lives in `recipe/drafter_cotraining/`** (a git submodule).
+The parent `verl/` is used as-is — **zero verl core changes**.
 
 **Default rule for new work:**
 
-> *Put changes in `recipe/drafter_cotraining/` whenever it can fit there.
-> Touch `verl/...` (parent) only when you genuinely need to extend
-> verl-side base infrastructure or when the parent change is so small
-> that mirroring through the submodule would be more friction than
-> value.*
+> *Put all changes in `recipe/drafter_cotraining/`. Touch `verl/...` (parent)
+> only if the change is a generic upstream improvement that benefits all verl
+> users and could be upstreamed as a separate PR.*
 
 Concrete guidance:
 
@@ -72,13 +63,12 @@ Concrete guidance:
 | Eagle3 model / loss / draft | `recipe/drafter_cotraining/eagle3/...` |
 | Mooncake transfer / KV connector | `recipe/drafter_cotraining/mooncake/...` |
 | HS collector manager | `recipe/drafter_cotraining/hs_collector/...` |
-| Drafter trainers / data controller / launchers | `recipe/drafter_cotraining/{main_drafter_ct,main_drafter_pretrain}.py` + `trainer/{ray_trainer,pretrain_trainer}.py` + `data/controller.py` |
+| Pretrain trainer / launcher | `recipe/drafter_cotraining/{main_drafter_pretrain.py,trainer/pretrain_trainer.py}` |
+| Data pipeline / collator | `recipe/drafter_cotraining/{data/,utils/}` |
 | Test / smoke scripts | `recipe/drafter_cotraining/scripts/...` |
 | Drafter unit tests | `recipe/drafter_cotraining/tests/...` |
 | Drafter YAML config / draft model JSONs | `recipe/drafter_cotraining/config/...` |
 | Top-level smoke wrappers | `scripts/run_drafter_*.sh` (parent — they shell out to recipe scripts) |
-| Drafter→rollout weight sync (TODO 4) | parent `verl/workers/rollout/vllm_rollout/...` (parent must grow the receiving end) |
-| New verl base-class hooks (FSDPEngine, RayPPOTrainer, dispatch modes) | parent `verl/...` |
 | Design / status docs | parent `claude_docs/...` |
 
 **Submodule workflow** for recipe changes:
@@ -91,57 +81,43 @@ git push origin2 feat/drafter-cotraining
 cd /root/verl                           # parent
 git add recipe                          # stage gitlink bump
 git commit -m "[drafter] bump recipe submodule: <topic>"
-git push                                # parent stays on feat/drafter-cotraining (or your topic branch)
+git push                                # parent stays on feat/draft-model-train
 ```
-
-**When in doubt** — start in the recipe. If you find yourself needing
-to subclass / monkey-patch a verl base class repeatedly, that's a
-signal that a small parent-side hook would be the cleaner fix; promote
-it to parent then.
 
 ### Key Documents
 
 | Doc | Role | What |
 |---|---|---|
-| `claude_docs/migration-status.md` | **Current state** | What's done, what's TODO (ordered), frozen module sync, verification checklist |
+| `claude_docs/migration-status.md` | **Current state** | What's done, what's deferred, verification checklist |
 | `claude_docs/drafter-design.md` | **As-built design** | Architecture, data lifecycle, training-step shape, engine-choice rationale |
-| `claude_docs/torchspec-to-verl-migration-map.md` | **Reference** | TorchSpec internals + file-by-file connection map to verl |
+| `claude_docs/weight-sync-flows.md` | **Weight sync** | Parameter inventory + 4 sync flows (Flows 2-4 deferred) |
 
 ### Testing
 
-Smoke wrappers (live in parent — shell into the recipe-side tests):
+**Verification command** (Qwen3-8B pretrain):
 
 ```bash
-# Rollout + HS collection + mesh dispatch (no drafter training)
-./scripts/run_drafter_rollout_hs.sh
-
-# Close-loop drafter training (rollout → HS → forward → backward → opt step)
-./scripts/run_drafter_training.sh                    # MAX_STEPS=32 default
-MAX_STEPS=16 ./scripts/run_drafter_training.sh       # quick smoke
+DATA_DIR=/root/verl/data/qwen3_8b_eagle3_ultrachat \
+  ./recipe/drafter_cotraining/scripts/run_qwen3_8b_eagle3_pretrain.sh \
+  trainer.total_training_steps=16
 ```
 
 Recipe-side test/diag scripts (run directly):
 
 ```bash
-# Mooncake store put/get/remove cycle (needs mooncake_master)
-python recipe/drafter_cotraining/scripts/test_mooncake_store.py
-
-# Mooncake round-trip with configurable shapes (needs mooncake_master)
-python recipe/drafter_cotraining/scripts/test_vllm_hs_collector.py --seq-len 256 --hidden-dim 3584 --num-samples 5
-
-# Single-controller simulation of drafter pipeline
-python recipe/drafter_cotraining/scripts/test_single_controller_hs.py
-
-# Standalone HSCollectorManager end-to-end: vLLM → Mooncake → reader (needs GPU + mooncake_master)
-python recipe/drafter_cotraining/scripts/test_hs_collector.py --model Qwen/Qwen2.5-0.5B-Instruct
-
 # Eagle3 loss kernel unit tests
 pytest recipe/drafter_cotraining/tests/test_eagle3_loss.py
+
+# Vocab mapping unit tests
+pytest recipe/drafter_cotraining/tests/test_vocab_mapping.py
+
+# Pretrain loss mask pipeline test
+pytest recipe/drafter_cotraining/tests/test_pretrain_loss_mask_pipeline.py
 ```
 
 ---
 
-## Core Architecture
+## Core Architecture (Reference)
 
 ### 3-Layer Composition
 
@@ -156,11 +132,11 @@ Handles gradient computation: forward/backward/optimizer.
 
 ```
 BaseEngine
-├── FSDPEngine           (engine/fsdp/transformer_impl.py)
-├── FSDPDrafterEngine    (recipe/drafter_cotraining/workers/drafter_engine.py)   ← submodule
-├── MegatronEngine       (engine/megatron/transformer_impl.py)
-├── VeOmniEngine         (engine/veomni/transformer_impl.py)
-└── MindspeedEngine      (engine/mindspeed/transformer_impl.py)
+|-- FSDPEngine           (engine/fsdp/transformer_impl.py)
+|-- FSDPDrafterEngine    (recipe/drafter_cotraining/workers/drafter_engine.py)   <- submodule
+|-- MegatronEngine       (engine/megatron/transformer_impl.py)
+|-- VeOmniEngine         (engine/veomni/transformer_impl.py)
+`-- MindspeedEngine      (engine/mindspeed/transformer_impl.py)
 ```
 
 Selected via `EngineRegistry` with key `(model_type, backend, device)`.
@@ -172,11 +148,11 @@ Handles autoregressive token generation via inference servers.
 
 ```
 BaseRollout
-├── ServerAdapter (SGLang)   — HTTP client
-├── ServerAdapter (vLLM)     — Ray actor client
-├── ServerAdapter (TRT-LLM)  — HTTP client
-├── HFRollout                — Sync HuggingFace
-└── NaiveRollout             — Single-GPU PyTorch
+|-- ServerAdapter (SGLang)   — HTTP client
+|-- ServerAdapter (vLLM)     — Ray actor client
+|-- ServerAdapter (TRT-LLM)  — HTTP client
+|-- HFRollout                — Sync HuggingFace
+`-- NaiveRollout             — Single-GPU PyTorch
 ```
 
 Selected via `_ROLLOUT_REGISTRY` with key `(engine_name, mode)`.
@@ -190,14 +166,14 @@ Wraps one BaseEngine. Adds dispatch/collect decorators, micro-batching, loss inj
 The "hybrid worker" — composes multiple TrainingWorkers + BaseRollout:
 
 ```python
-self.actor:   TrainingWorker  → BaseEngine   # policy gradient
-self.ref:     TrainingWorker  → BaseEngine   # frozen reference (optional)
+self.actor:   TrainingWorker  -> BaseEngine   # policy gradient
+self.ref:     TrainingWorker  -> BaseEngine   # frozen reference (optional)
 self.rollout: BaseRollout                    # token generation
 ```
 
 Roles: "actor" | "rollout" | "ref" | "actor_rollout" | "actor_rollout_ref"
 
-### Engine ↔ Rollout Connection (Weight Sync)
+### Engine <-> Rollout Connection (Weight Sync)
 `update_weights()` bridges the two engine types:
 1. `rollout.resume(tags=["weights"])` — wake rollout GPU memory
 2. `actor.engine.get_per_tensor_param()` — extract trained weights
@@ -206,26 +182,6 @@ Roles: "actor" | "rollout" | "ref" | "actor_rollout" | "actor_rollout_ref"
 5. `rollout.resume(tags=["kv_cache"])` — allocate KV cache
 
 GPU time-multiplexing: training engine and rollout engine share GPU but never run simultaneously.
-
-### Two Worker Implementations
-- **`engine_workers.py`** (new) — Engine-agnostic via EngineRegistry
-- **`fsdp_workers.py`** (legacy) — FSDP-specific, directly manages FSDP model/optimizer
-
-## Training Loop (RayPPOTrainer.fit)
-
-```
-① generate_sequences()  → Rollout Engine
-② collect_hidden_states()→ vLLM HS Collector (NEW — drafter pipeline)
-③ dispatch drafter data  → DrafterDataController (NEW)
-④ update_drafter()       → FSDPDrafterEngine (NEW)
-⑤ compute_reward()       → Reward workers
-⑥ compute_values()       → Critic Training Engine
-⑦ compute_log_prob()     → Actor Training Engine (eval mode)
-⑧ compute_advantage()    → Driver (GAE/GRPO)
-⑨ update_critic()        → Critic Training Engine (train mode)
-⑩ update_actor()         → Actor Training Engine (train mode)
-⑪ update_weights()       → Sync actor + drafter weights → Rollout + HS Collector
-```
 
 ## Key Patterns
 - **Registry pattern**: `EngineRegistry` and `_ROLLOUT_REGISTRY` for pluggable backends
@@ -239,16 +195,15 @@ GPU time-multiplexing: training engine and rollout engine share GPU but never ru
 |------|---------|
 | `verl/trainer/ppo/ray_trainer.py` | Main orchestrator (RayPPOTrainer) |
 | `verl/workers/engine_workers.py` | TrainingWorker + ActorRolloutRefWorker (new) |
-| `verl/workers/drafter_workers.py` | ActorRolloutRefDrafterWorker (NEW — drafter co-training) |
 | `verl/workers/fsdp_workers.py` | Legacy FSDP workers (ActorRolloutRefWorker + CriticWorker) |
 | `verl/workers/engine/base.py` | BaseEngine + EngineRegistry |
-| `verl/workers/engine/fsdp/drafter_impl.py` | FSDPDrafterEngine (NEW — "drafter_model") |
 | `verl/workers/rollout/base.py` | BaseRollout + rollout registry |
-| `verl/workers/rollout/vllm_rollout/vllm_hs_collector.py` | VllmHSCollector (NEW — HS extraction) |
-| `verl/utils/mooncake/` | Mooncake KV store + KV connector (NEW) |
-| `verl/models/eagle3/` | Eagle3 model + Forward KL loss (NEW) |
-| `verl/trainer/drafter/controller.py` | DrafterDataController (NEW — driver-side) |
 | `verl/single_controller/ray/base.py` | RayWorkerGroup (dispatch/collect) |
+| `recipe/drafter_cotraining/workers/engine_workers.py` | DrafterPretrainWorker + ActorRolloutRefDrafterWorker (deferred) |
+| `recipe/drafter_cotraining/workers/drafter_engine.py` | FSDPDrafterEngine (Eagle3 model) |
+| `recipe/drafter_cotraining/trainer/pretrain_trainer.py` | DraftModelPretrainTrainer |
+| `recipe/drafter_cotraining/hs_collector/` | HSCollectorManager |
+| `recipe/drafter_cotraining/mooncake/` | Mooncake KV store + KV connector |
 
 ## Workflow Orchestration
 
@@ -270,6 +225,6 @@ Core principles: **Simplicity First** | **No Laziness** (root causes only) | **M
 - Don't over-engineer — this is research code, can be experimental.
 - Don't use too many try-catch unless necessary.
 - Use `tasks` to maintain todos.
-- No unanimity gate needed — controller pattern guarantees consensus by construction.
+- **Zero verl core changes** — all drafter code lives in `recipe/drafter_cotraining/`. The verl/ submodule is used as-is from upstream.
 - vLLM captures pre-norm last_hidden_states — `FSDPDrafterEngine.prepare_model_inputs()` applies `verifier_norm` before target construction. The loss kernel's RMSNorm is for the draft model's own norm (separate concern).
-- Don't confused yourself with the legacy worker implementation. For instance (`verl/workers/actor/dp_actor.py`). This is supposed to be deprecated soonly 
+- `DrafterPretrainWorker` has `self.rollout = None` — it never touches the vLLM rollout engine. Frozen weights are loaded from `target_model_path` on disk, not from a live actor.

@@ -1,13 +1,16 @@
-# Drafter ↔ Target — Parameters & Weight-Sync Flows
+# Drafter <-> Target — Parameters & Weight-Sync Flows
 
 Documents:
 1. **What's shared** between draft and target (parameter inventory).
-2. **How it stays in sync** as the actor trains every RL step.
+2. **How it stays in sync** in pretrain-only mode (simple) vs co-training (deferred).
 
-**Key principle.** In verl, the actor IS the target model and trains
-every RL step (unlike TorchSpec's offline distillation where the
-target is fixed). Frozen module copies in the drafter need re-syncing
-after each `update_actor()`.
+**Key principle (pretrain-only):** Frozen weights are loaded from
+`target_model_path` on disk at init. There is no live actor, so no
+re-sync is needed. The target model is frozen throughout pretrain.
+
+**Key principle (co-training, deferred):** In verl's RL loop, the actor
+IS the target model and trains every RL step. Frozen module copies in
+the drafter need re-syncing after each `update_actor()`.
 
 ---
 
