@@ -183,7 +183,7 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
-        return await self.engine.collective_rpc(
+        await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
