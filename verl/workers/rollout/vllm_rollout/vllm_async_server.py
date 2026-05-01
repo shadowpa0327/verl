@@ -519,6 +519,9 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        kv_params = getattr(final_res, "kv_transfer_params", None)
+        if kv_params:
+            extra_fields["kv_transfer_params"] = kv_params
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
